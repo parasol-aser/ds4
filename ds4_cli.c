@@ -606,9 +606,14 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         cli_greedy_argmax_requested(speculative_argmax);
     bool have_greedy_next = false;
     int greedy_next = -1;
+    /* DS4_TOKEN_TIMING: per-token CPU split (sample / emit / eval). */
+    const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
+    double t_sample = 0.0, t_emit = 0.0, t_eval = 0.0;
+    int n_timed = 0;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token;
+        const double t_s0 = token_timing ? cli_now_sec() : 0.0;
         if (greedy_argmax && have_greedy_next) {
             token = greedy_next;
             have_greedy_next = false;
@@ -616,6 +621,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             token = ds4_session_sample(session, cfg->gen.temperature, 0,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
         }
+        if (token_timing) t_sample += cli_now_sec() - t_s0;
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
 
         int toks[17];
@@ -636,6 +642,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 return 1;
             }
         } else {
+            const double t_e0 = token_timing ? cli_now_sec() : 0.0;
             size_t piece_len = 0;
             char *piece = ds4_token_text(engine, token, &piece_len);
             token_printer_write_text(&printer, piece, piece_len);
@@ -646,9 +653,16 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 continue;
             }
 
+            const double t_v0 = token_timing ? cli_now_sec() : 0.0;
             cli_dist_busy_set(cfg, true);
             int eval_rc = ds4_session_eval(session, token, err, sizeof(err));
             cli_dist_busy_set(cfg, false);
+            if (token_timing) {
+                const double t_v1 = cli_now_sec();
+                t_emit += t_v0 - t_e0;
+                t_eval += t_v1 - t_v0;
+                n_timed++;
+            }
             if (eval_rc != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 ds4_session_free(session);
@@ -676,6 +690,12 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     const double t_decode1 = cli_now_sec();
     generation_done(&printer);
     if (cli_interrupt_requested()) cli_interrupt_clear();
+    if (token_timing && n_timed > 0) {
+        fprintf(stderr, "ds4: per-token cpu split: sample %.3f ms, emit %.3f ms, eval %.3f ms "
+                "(temp %.3f top_p %.3f min_p %.3f)\n",
+                1000.0 * t_sample / n_timed, 1000.0 * t_emit / n_timed,
+                1000.0 * t_eval / n_timed, cfg->gen.temperature, cfg->gen.top_p, cfg->gen.min_p);
+    }
 
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;

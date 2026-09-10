@@ -1576,7 +1576,7 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
         clock_gettime(CLOCK_MONOTONIC, &ts_mono);
         const double mono_ms = (double)ts_mono.tv_sec * 1e3 + (double)ts_mono.tv_nsec / 1e6;
         fprintf(stderr, "ds4: cb '%s': mono %.1f ms: ", label ? label : "?", mono_ms);
-        fprintf(stderr, "encode %.1f ms, commit->done %.1f ms, gpu span %.1f ms, gpu start +%.1f ms, caller 0x%llx\n",
+        fprintf(stderr, "encode %.1f ms, commit->done %.1f ms, gpu span %.3f ms, gpu start +%.1f ms, caller 0x%llx\n",
                 t_commit - g_batch_cb_created_ms, t_done - t_commit,
                 (cb.GPUEndTime - cb.GPUStartTime) * 1e3,
                 cb.GPUStartTime * 1e3 - (mono_ms - (t_done - t_commit)),

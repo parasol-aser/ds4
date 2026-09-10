@@ -38,6 +38,12 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 - `ds4_metal.m`: Objective-C Metal runtime and kernel wrappers.
 - `metal/*.metal`: compute kernels.
 - `tests/`: unit and live integration tests.
+- Sampler note: ds4.c is built with `-ffast-math` on Darwin, which implies
+  finite-math-only. `isfinite()` there is a slow libm call and an exponent-bit
+  test on a float value gets folded to "true"; test the bits loaded from
+  memory (`sample_finite(const float *)`) and keep the vocabulary scans
+  branch-free so they vectorize. `DS4_TOKEN_TIMING=1` on the CLI prints the
+  per-token CPU split (sample / emit / eval).
 - `misc/`: ignored notes, experiments, and old planning material.
 
 This list is not complete, check the files for more info.

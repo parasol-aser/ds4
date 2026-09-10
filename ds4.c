@@ -40076,6 +40076,50 @@ static inline void argmax_f32_unrolled8_range(
     }
 }
 
+/* Finite test for the sampler scans.  isfinite() costs a libm call under
+ * this build's math flags and dominated the 248k-entry passes, while an
+ * exponent-bit test on a float *value* gets folded to "true" by
+ * -ffinite-math-only.  Testing the bits as loaded from memory survives
+ * both: the optimizer has no float-class knowledge about an integer load. */
+static inline bool sample_finite(const float *p) {
+    uint32_t bits;
+    memcpy(&bits, p, sizeof(bits));
+    return (bits & 0x7f800000u) != 0x7f800000u;
+}
+
+/* Finite count, max logit and its first index in one branch-free pass
+ * (the compiler vectorizes it); a scalar `continue` per element costs a
+ * millisecond per 248k-entry vocabulary. */
+static void sample_scan_finite_max(
+        const float *logits,
+        uint32_t     n_vocab,
+        float       *max_out,
+        int         *best_out,
+        uint32_t    *finite_out) {
+    float mx = -FLT_MAX;
+    uint32_t finite = 0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const bool f = sample_finite(logits + i);
+        const float v = f ? logits[i] : -FLT_MAX;
+        finite += f ? 1u : 0u;
+        mx = v > mx ? v : mx;
+    }
+    int best = 0;
+    if (finite == 0) {
+        mx = DS4_NEG_INF;
+    } else {
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            if (sample_finite(logits + i) && logits[i] == mx) {
+                best = (int)i;
+                break;
+            }
+        }
+    }
+    *max_out = mx;
+    *best_out = best;
+    *finite_out = finite;
+}
+
 static int sample_argmax_unrolled8(const float *logits, uint32_t n_vocab) {
     int best = 0;
     float best_v = DS4_NEG_INF;
@@ -40238,7 +40282,7 @@ static bool sample_build_probabilities(
     uint32_t heap_n = 0;
     float max_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < n_vocab; i++) {
-        if (!isfinite(logits[i])) continue;
+        if (!sample_finite(logits + i)) continue;
         finite++;
         if (logits[i] > max_logit) max_logit = logits[i];
     }
@@ -40251,7 +40295,7 @@ static bool sample_build_probabilities(
     float heap_sum = 0.0f;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
-        if (!isfinite(v)) continue;
+        if (!sample_finite(logits + i)) continue;
         const float raw = expf((v - max_logit) / temperature);
         full_sum += raw;
         sample_candidate cand = {.id = (int)i, .logit = v, .prob = raw};
@@ -40306,7 +40350,7 @@ static bool sample_build_probabilities(
         cand_n = 0;
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
-            if (!isfinite(v)) continue;
+            if (!sample_finite(logits + i)) continue;
             cand[cand_n++] = (sample_candidate){
                 .id = (int)i,
                 .logit = v,
@@ -40391,6 +40435,21 @@ static int sample_residual_probabilities(float *target_probs,
 }
 #endif
 
+/* exp(x) for the softmax tail, x <= 0: 2^n * 2^f with a degree-5 fit of
+ * 2^f on [0, 1) (relative error under 2e-6).  Only the mass of tokens that
+ * cannot reach the candidate heap goes through here; candidates keep expf. */
+static inline float sample_tail_exp(float x) {
+    if (x < -80.0f) return 0.0f;
+    const float t = x * 1.44269504f;
+    const float n = floorf(t);
+    const float f = t - n;
+    const float p = 1.0f + f * (0.69314718f + f * (0.24022652f + f * (0.05550411f +
+                                f * (0.00961813f + f * 0.00133336f))));
+    union { float f; int32_t i; } u;
+    u.i = ((int32_t)n + 127) << 23;
+    return p * u.f;
+}
+
 static bool sample_fast_top_p(
         const float *logits,
         uint32_t     n_vocab,
@@ -40413,22 +40472,54 @@ static bool sample_fast_top_p(
     float sum = 0.0f;
     float heap_sum = 0.0f;
 
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        const float p = expf((v - max_logit) / temperature);
-        sum += p;
-        sample_candidate cand = {.id = (int)i, .logit = v, .prob = p};
-        if (n < cap) {
-            heap[n] = cand;
-            heap_sum += p;
-            sample_heap_sift_up(heap, n);
-            n++;
-        } else if (sample_candidate_gt(cand, heap[0])) {
-            heap_sum -= heap[0].prob;
-            heap[0] = cand;
-            heap_sum += p;
-            sample_heap_sift_down(heap, n, 0);
+    const float inv_temperature = 1.0f / temperature;
+    enum { SAMPLE_TAIL_BLOCK = 16 };
+    for (uint32_t i0 = 0; i0 < n_vocab; i0 += SAMPLE_TAIL_BLOCK) {
+        const uint32_t i1 = i0 + SAMPLE_TAIL_BLOCK <= n_vocab ? i0 + SAMPLE_TAIL_BLOCK : n_vocab;
+        /* Once the heap is full, a block whose every logit sits below the
+         * heap minimum only feeds the normalizer: a branch-free vector
+         * pass with the tail exp instead of a libm expf per token, which
+         * is most of a 248k vocabulary. */
+        if (n == cap && i1 - i0 == SAMPLE_TAIL_BLOCK) {
+            bool all_finite = true;
+            float block_max = -FLT_MAX;
+            for (uint32_t i = i0; i < i1; i++) {
+                const bool f = sample_finite(logits + i);
+                const float v = f ? logits[i] : -FLT_MAX;
+                all_finite = all_finite && f;
+                block_max = v > block_max ? v : block_max;
+            }
+            if (all_finite && block_max < heap[0].logit) {
+                float block_sum = 0.0f;
+                for (uint32_t i = i0; i < i1; i++) {
+                    block_sum += sample_tail_exp((logits[i] - max_logit) * inv_temperature);
+                }
+                sum += block_sum;
+                continue;
+            }
+        }
+        for (uint32_t i = i0; i < i1; i++) {
+            const float v = logits[i];
+            if (!sample_finite(logits + i)) continue;
+            const float scaled = (v - max_logit) * inv_temperature;
+            if (n == cap && !(v > heap[0].logit || (v == heap[0].logit && (int)i < heap[0].id))) {
+                sum += sample_tail_exp(scaled);
+                continue;
+            }
+            const float p = expf(scaled);
+            sum += p;
+            sample_candidate cand = {.id = (int)i, .logit = v, .prob = p};
+            if (n < cap) {
+                heap[n] = cand;
+                heap_sum += p;
+                sample_heap_sift_up(heap, n);
+                n++;
+            } else if (sample_candidate_gt(cand, heap[0])) {
+                heap_sum -= heap[0].prob;
+                heap[0] = cand;
+                heap_sum += p;
+                sample_heap_sift_down(heap, n, 0);
+            }
         }
     }
     if (sum <= 0.0f || !isfinite(sum)) {
@@ -40487,18 +40578,10 @@ static int sample_full_vocab(
         float        min_p,
         uint64_t    *rng,
         float       *prob_scratch) {
-    float max_logit = DS4_NEG_INF;
-    int best = 0;
-    uint32_t finite = 0;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        finite++;
-        if (v > max_logit) {
-            max_logit = v;
-            best = (int)i;
-        }
-    }
+    float max_logit;
+    int best;
+    uint32_t finite;
+    sample_scan_finite_max(logits, n_vocab, &max_logit, &best, &finite);
     if (finite == 0) return sample_argmax(logits, n_vocab);
 
     int fast_token = best;
@@ -40543,7 +40626,7 @@ static int sample_full_vocab(
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
             prob_scratch[i] = -1.0f;
-            if (!isfinite(v)) continue;
+            if (!sample_finite(logits + i)) continue;
             const float scaled = (v - max_logit) / temperature;
             if (have_reject_scaled && scaled <= reject_scaled) continue;
             const float p = expf(scaled);
@@ -40574,7 +40657,7 @@ static int sample_full_vocab(
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
             prob_scratch[i] = -1.0f;
-            if (!isfinite(v)) continue;
+            if (!sample_finite(logits + i)) continue;
             const float p = expf((v - max_logit) / temperature);
             prob_scratch[i] = p;
             sum += p;
@@ -40598,13 +40681,42 @@ static int sample_full_vocab(
             };
         }
     } else {
-        cand = xmalloc((size_t)finite * sizeof(cand[0]));
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
-            cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
-            sum += p;
+        /* The nucleus is wider than the fast heap.  Collect every token at
+         * or above a logit cutoff, lowering the cutoff until the collected
+         * mass covers top_p, and sort only that set: the nucleus is the
+         * highest-probability prefix, so any cutoff whose mass reaches
+         * top_p already contains it.  The full normalizer comes from the
+         * first pass; tokens below the cutoff use the tail approximation
+         * there.  This keeps the per-token cost at a few passes over the
+         * vocabulary instead of a 248k-entry qsort. */
+        const float inv_temperature = 1.0f / temperature;
+        uint32_t cap = 4096;
+        cand = xmalloc((size_t)cap * sizeof(cand[0]));
+        float cutoff = max_logit - 8.0f * temperature;
+        float cand_sum = 0.0f;
+        for (int pass = 0; ; pass++) {
+            n = 0;
+            cand_sum = 0.0f;
+            float tail_sum = 0.0f;
+            for (uint32_t i = 0; i < n_vocab; i++) {
+                const float v = logits[i];
+                if (!sample_finite(logits + i)) continue;
+                const float scaled = (v - max_logit) * inv_temperature;
+                if (v < cutoff) {
+                    if (pass == 0) tail_sum += sample_tail_exp(scaled);
+                    continue;
+                }
+                if (n == cap) {
+                    cap *= 2u;
+                    cand = xrealloc(cand, (size_t)cap * sizeof(cand[0]));
+                }
+                const float p = expf(scaled);
+                cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
+                cand_sum += p;
+            }
+            if (pass == 0) sum = cand_sum + tail_sum;
+            if (cand_sum >= top_p * sum || n == finite || !(cutoff > -FLT_MAX)) break;
+            cutoff -= 4.0f * temperature;
         }
     }
     if (sum <= 0.0f || !isfinite(sum)) {
@@ -40672,7 +40784,7 @@ static int sample_top_p_min_p(
     int n = 0;
     for (uint32_t i = 0; i < n_vocab; i++) {
         float v = logits[i];
-        if (!isfinite(v)) continue;
+        if (!sample_finite(logits + i)) continue;
         if (n == top_k && v <= vals[n - 1]) continue;
         int j = n < top_k ? n++ : n - 1;
         while (j > 0 && vals[j - 1] < v) {

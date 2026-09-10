@@ -1413,11 +1413,15 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
     const uint64_t rid = tgpig;
 
     const short iwg = tiisg;
+    /* Lanes are workgroups; with fewer than 32 workgroups the spare lanes
+     * carry an empty split (S = 0, M = -inf) so the simd reductions and
+     * htmp gathers below stay in bounds. */
+    const bool live = iwg < NWG_;
 
     device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV_*NWG_;
 
-    float S = ss[rid*(2*NWG_) + 2*iwg + 0];
-    float M = ss[rid*(2*NWG_) + 2*iwg + 1];
+    float S = live ? ss[rid*(2*NWG_) + 2*iwg + 0] : 0.0f;
+    float M = live ? ss[rid*(2*NWG_) + 2*iwg + 1] : -INFINITY;
 
     const float m  = simd_max(M);
     const float ms = exp(M - m);
@@ -1431,7 +1435,7 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
 
     for (short i = sgitg; i < DV4; i += NWG_) {
-        const float4 v = simd_sum(htmp4[i*NWG_ + iwg]*ms);
+        const float4 v = simd_sum(live ? htmp4[i*NWG_ + iwg]*ms : float4(0.0f));
 
         if (iwg == 0) {
             dst4[i] = v*S;
