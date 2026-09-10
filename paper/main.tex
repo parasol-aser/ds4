@@ -22,76 +22,121 @@
 \maketitle
 
 \begin{abstract}
-On unified-memory Apple silicon, single-stream LLM decode is usually described
-as memory-bandwidth bound, yet the most widely used runner reaches 45\% of the
-nominal bandwidth roofline and 58\% of the measured streaming ceiling on
-Qwen3.8-27B in Q4\_K. We decompose a decode token on an M2~Ultra into weight
-streaming, matvec kernel efficiency, per-dispatch overhead, and CPU work on the
-inter-token critical path, using command-buffer GPU timestamps rather than wall
-clock so that sub-millisecond kernels are attributed correctly. Working inside
-\ds{}, an open-source model-specific C/Metal engine, we add support for the
-model and then apply three levers, each with a runtime switch so it can be
-ablated: fewer bytes per token, fewer and better-shaped dispatches, and a
-shorter CPU path between tokens. Decode rises from 29.3 to 33.1~\tps{}
-(llama.cpp: 23.8), 81\% of the measured streaming ceiling, with logits that
-match llama.cpp at an arbitrary decode step. A controlled comparison of Q4\_0
-against Q4\_K on identical weights shows the block format is worth 7--19\% with
-simple kernels and 1--2\% once the large matvecs are fused, because both
-formats then stream at the same ceiling; MLX reaches the same rate on its
-affine 4-bit format. We also fix a 2~ms-per-token sampler cost caused by
-\texttt{isfinite} under \texttt{-ffast-math}, report three optimizations that
-did not help and why, and release the code, switches and scripts.
+Large language models are increasingly run on personal machines, and Apple
+silicon with unified memory is one of the few consumer platforms that holds a
+25--100B-parameter model in a single address space. Single-stream decode on
+such a machine is usually described as memory-bandwidth bound: every token
+reads every weight, so throughput should be bandwidth divided by model bytes.
+Yet the most widely used runner reaches 45\% of that bound on Qwen3.8-27B in
+Q4\_K on an M2~Ultra, and 58\% of the streaming rate the GPU actually
+achieves. This paper asks where the rest of the token goes. We decompose a
+decode token into weight streaming, matvec kernel efficiency, per-dispatch
+overhead and CPU work between tokens, using command-buffer GPU timestamps so
+that sub-millisecond kernels are attributed correctly, and we find that at
+this scale each of the last three costs milliseconds. Working inside \ds{}, an
+open-source model-specific C/Metal engine, we add the model and then pull
+three levers, each behind a runtime switch so it can be ablated: fewer bytes
+per token, fewer and better-shaped dispatches, and a shorter CPU path between
+tokens. Decode rises from 29.3 to 33.1~\tps{} (llama.cpp: 23.8), 81\% of the
+streaming ceiling, with logits that match llama.cpp at an arbitrary decode
+step. Two results reach beyond this engine. A controlled experiment with the
+same weights in Q4\_0 and Q4\_K shows that the block format is worth 7--19\%
+with simple kernels and 1--2\% once the large matvecs are fused, because both
+formats then stream at the same ceiling; MLX reaches that ceiling on its
+affine 4-bit format without any model-specific fusion. And a 2~ms-per-token
+cost hiding in the sampler, caused by \texttt{isfinite} under
+\texttt{-ffast-math}, shows that the CPU gap between tokens has to be measured
+on its own. We report three optimizations that did not help and why, and
+release the code, switches and scripts.
 \end{abstract}
 
 \section{Introduction}
 
-A 27B-parameter model in 4-bit quantization occupies about 15~GB, and a
-single-stream decode step reads all of it. On an M2~Ultra (800~GB/s nominal)
-the roofline is therefore about 53~\tps{}. llama.cpp decodes Qwen3.8-27B in
-Q4\_K at 23.8~\tps{} on this machine (\S\ref{sec:eval}). More than half of the
-token time is something other than moving weights, and the question this paper
-answers is what.
+Open-weight models in the 20--30B range now fit comfortably on a laptop or
+desktop with 64--192~GB of unified memory, and people run them locally for
+chat, coding agents and private workloads. On these machines the question is
+no longer whether a model fits but how fast it decodes, and the standard
+answer is a roofline argument: a decode step must read every weight once, so
+tokens per second is bounded by memory bandwidth over model bytes. For
+Qwen3.8-27B in Q4\_K, 15~GB per token on an M2~Ultra with 800~GB/s nominal,
+that bound is 53~\tps{}; the fastest kernel on this GPU streams at 670~GB/s,
+which puts the practical ceiling at 41~\tps{}. llama.cpp decodes the model at
+23.8~\tps{} (\S\ref{sec:eval}). More than half of every token is something
+other than moving weights.
 
-The setting matters. Apple silicon is one of the few consumer platforms where
-25--100B-parameter models fit in one address space, and people run such models
-locally for chat, coding agents and private workloads. Its GPU is programmed
-through Metal, kernels are dispatched from command buffers, and the CPU shares
-the memory system, so CPU work between tokens delays the next submission. None
-of the standard CUDA decode analyses transfer directly.
+That half is hard to see, which is why it persists. A profiler that
+synchronizes at stage boundaries pays about 0.16~ms per boundary on this
+machine, more than most of the kernels it is trying to measure, so small
+kernels vanish into the floor. A system trace reports the GPU 96--98\% busy
+for both llama.cpp and our engine, which sounds like the roofline has been
+reached; it has not, because a kernel that is running is not a kernel that is
+streaming at full rate. And a 2~ms cost per token in the CPU sampler, one
+seventh of the GPU time, is invisible to every GPU-side tool. The first
+contribution of this paper is a way of measuring that makes each of these
+visible: per-stage GPU timestamps from the command buffers, a CPU
+inter-token split, and reference logits at an arbitrary decode step so that
+every change is checked where decode actually runs.
+
+With that instrument we pull three levers inside \ds{}, an open-source
+model-specific engine written in C and Metal, after adding the model to it.
+The levers are the bytes per token and how fast they move (the quantization
+format and the matvec inner loop), the number and shape of dispatches per
+token (fusing a layer's four side projections into one launch, the SwiGLU
+gate and up into one kernel, each residual add into the norm that consumes
+it, and scaling split-KV attention to the context), and the CPU path between
+tokens. Each lever has a switch, so the final build can reproduce any subset
+and switching everything off reproduces the original 29.2~\tps{} exactly.
+The result is 33.1~\tps{}, 81\% of the ceiling.
+
+Four findings are, we think, more useful than the speedup.
+\begin{itemize}
+\item \textbf{At 27B scale, dispatch count is a first-order term.} The
+  original graph issued about 1,070 dispatches per token; at a few
+  microseconds of ramp and drain each, that is as much time as the recurrence,
+  the attention and every norm together. Fusion is worth 3.9~\tps{} on its
+  own.
+\item \textbf{The matvec limiter is activation traffic, not occupancy.}
+  Splitting reductions across more threads (K-split) did nothing for the wide
+  projections; reading the activation once per four rows instead of two, and
+  reading it as vectors, did. The Q4\_K kernels end at 613~GB/s against
+  670~GB/s for Q8\_0, and the difference is dequantization work.
+\item \textbf{Format and fusion are not additive.} With simple kernels the
+  cheaper Q4\_0 block format is worth 19\% in llama.cpp and 7\% in \ds{};
+  with fused kernels it is worth 1--2\%, because both formats then stream at
+  the same ceiling. MLX, a general framework with no model-specific graph,
+  reaches that ceiling on its affine 4-bit format. Which lever matters depends
+  on how far the kernels already are from the ceiling.
+\item \textbf{The CPU is on the critical path.} The 2~ms sampler cost was an
+  \texttt{isfinite} call left as a library function by \texttt{-ffast-math};
+  the first fix was folded away by the same flags and broke NaN handling. Both
+  facts are general to any inference code built that way.
+\end{itemize}
 
 Our contributions are:
 \begin{enumerate}
-\item \textbf{A decomposition method for Metal decode} that attributes token
-  time to weight streaming, matvec efficiency, per-dispatch overhead and CPU
-  gaps (\S\ref{sec:method}). Stage timing uses the GPU start and end
-  timestamps of command buffers; timing on the CPU carries a ${\sim}0.16$~ms
-  synchronization floor that is larger than most of the kernels being
-  measured.
-\item \textbf{Optimizations, each measured in isolation}, organized by lever
-  (\S\ref{sec:opt}, Table~\ref{tab:ablation}): a multi-weight matvec that
-  issues a layer's side projections as one launch, a vectorized Q4\_K inner
-  loop, residual add fused into the following RMSNorm, a single-launch
-  attention prologue, a context-scaled split-KV attention, and a sampler
-  rewrite. Switching all of them off reproduces the pre-optimization baseline
-  exactly.
-\item \textbf{A controlled quantization-format experiment}
-  (\S\ref{sec:q40}) using the same weights in Q4\_0 and Q4\_K, in two engines
-  and at two kernel-fusion levels.
-\item \textbf{Negative results with mechanisms} (\S\ref{sec:negative}) and a
-  correctness protocol that compares logits with the reference implementation
-  at an arbitrary decode step (\S\ref{sec:correctness}).
+\item A measurement method for Metal decode that attributes token time to
+  weight streaming, matvec efficiency, per-dispatch overhead and CPU gaps,
+  with a correctness protocol at arbitrary decode steps (\S\ref{sec:method},
+  \S\ref{sec:correctness}).
+\item Qwen3.8-27B support in a model-specific engine, and a set of decode
+  optimizations each measured in isolation and each behind a switch
+  (\S\ref{sec:opt}, Table~\ref{tab:ablation}).
+\item A controlled quantization-format experiment on identical weights, in
+  two engines and at two fusion levels (\S\ref{sec:q40}), and a comparison
+  with MLX across context lengths (\S\ref{sec:eval}).
+\item Negative results with mechanisms (\S\ref{sec:negative}), a profile of a
+  mixture-of-experts model on the same instrument, and the code, switches
+  and scripts.
 \end{enumerate}
 
-The engine is \ds{} (DwarfStar), an open-source model-specific inference engine
-in C and Metal by Salvatore Sanfilippo and contributors~\cite{ds4}
-(\upstreamurl{}). It
-implements a handful of architectures as hand-written graphs rather than
-interpreting a generic GGUF computation graph. Our work adds Qwen3.8-27B to it,
-including the Gated DeltaNet and gated-attention kernels, and the decode paths
-and measurements described below; the code, the runtime switches and the
-experiment scripts are at \branchurl{}. We argue in \S\ref{sec:discussion}
-that the model-specific trade is the right one for the small set of models
-that people actually run locally.
+\ds{} (DwarfStar) is by Salvatore Sanfilippo and contributors~\cite{ds4}
+(\upstreamurl{}); it implements a handful of architectures as hand-written
+graphs rather than interpreting a generic GGUF computation graph. Our work
+adds Qwen3.8-27B, including its Gated DeltaNet and gated-attention kernels,
+and the decode paths and measurements described here; the branches and
+experiment scripts are at \branchurl{}. \S\ref{sec:discussion} argues that the
+model-specific trade is the right one for the small set of models people
+actually run locally.
 
 \section{Background}
 \label{sec:background}
