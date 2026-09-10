@@ -1,0 +1,96 @@
+<|im_start|>user
+Summarize the following document in exactly three sentences.
+
+<p align="center">
+  <img src="logo.svg" alt="DwarfStar logo" width="220">
+</p>
+
+**DwarfStar** is a small native inference engine optimized first for
+**DeepSeek V4 Flash** (including the experimental vision model).
+It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, and,
+on very high-memory machines, **DeepSeek V4 PRO**. It is self-contained and
+deliberately narrow, not a general GGUF runner. Model loading, prompt rendering,
+tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
+The repository also includes tools and data for GGUF, imatrix, quality, and speed.
+
+Supported backends:
+
+* **Metal**, the primary target, on Macs with 96 GB or more. Smaller machines
+  can use SSD streaming.
+* **NVIDIA CUDA**, including multi-GPU systems and DGX Spark.
+* **ROCm** on Strix Halo systems such as the Framework Desktop.
+
+This project would not exist without **llama.cpp and GGML**, make sure to read
+the acknowledgements section, a big thank you to Georgi Gerganov and all the
+other contributors.
+
+Model support is intentionally opportunistic. The project follows the best open
+weights for useful local machine sizes, especially 128 GB laptops and 512 GB
+workstations. A model may be removed when a better replacement arrives.
+
+The project has first class support for SSD streaming of weights, so it is
+possible to run models bigger than RAM while often still getting decent
+performances, and even running very large models (like the full GLM 5.3 or DeepSeek v4 PRO)
+on systems with just 128GB of RAM at a slower speed, but fast enough for
+QA-style chats.
+
+# So, what can I do with this software?
+
+* You can run a very capable models in your consumer hardware, a MacBook, a DGX Spark, or a Strix Halo for example. Even if you have not enough RAM, with SSD streaming, you can run it at a decent speed.
+* Using the CUDA multi-GPU support and with ds4-server micro batching of decoding and generation, you can turn a server with old-ish CUDA cards (Ada Lovelace architecture), no longer supported for new models by vLLM, into a multi-user LLM server for your company. We tested this setup with 8xL40S NVIDIA cards and multiple sessions with very good results. 120 t/s aggreated generation, 2000 t/s prefill.
+* Using two MacBook M5 Max / M3 Ultra RDMA, you can run 4 bit DeepSeek Flash, GLM 5.2, or GLM 5.3 Flash with tensor parallelism.
+* You can also use pipeline paralellism to glue together multiple systems to sum their RAM and run larger models.
+
+## Motivations
+
+* Capable open-weight models now fit on high-end personal machines.
+* DeepSeek V4 Flash and PRO, GLM 5.2, tolerate aggressive routed-expert quantization.
+* Compressed KV caches and fast local SSDs make long contexts practical.
+* The idea of an inference system specialized for a few models.
+
+# AI full disclosure
+
+* This software is developed with **strong assistance from GPT 5.5, 5.6, Claude Fable** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
+
+## Acknowledgements to llama.cpp and GGML
+
+`ds4.c` does not link against GGML, but it **exists thanks to the path opened by the
+llama.cpp project and the kernels, quantization formats, GGUF ecosystem, and hard-won
+engineering knowledge developed there**.
+We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
+and its contributors. Their implementation, kernels, tests, and design choices were
+an essential reference while building this DeepSeek V4 specific inference path.
+Some source-level pieces are retained or adapted here under the MIT license: GGUF
+quant layouts and tables, CPU quant/dot logic, and certain kernels. For this
+reason, and because we are genuinely grateful, we keep the GGML authors copyright
+notice in our `LICENSE` file.
+
+## Status
+
+The software is currently very fast changing. Consider it beta quality.
+Before each release, a big QA run is executed, however instabilities
+are definitely possible.
+
+# How to use this project?
+
+I (Salvatore) believe that the way projects should be shipped and used changed because of AI. The main differences today are:
+
+1. With AI, users can modify the software in significant ways with low efforts, costs, and even lacking deep domain knowledge about the task they want to accomplish. For instance, a DwarfStar user with a specific hardware setup can ask a coding agent to improve the inference speed of this software for the specific hardware setup, asking the model to reach the maximum prefill and generation speed without impacting correctness, and also asking to do a deep QA pass.
+2. Similiarly, because of "1", software may be shipped in a different way than before. It must be more a working template for the biggest use cases, without trying to cover every possible setup. If DwarfStar showcases a few good implementations of tensor parallel execution, the code will work as a rail for implementing the same feature in specific conditions, for a new model, and so forth.
+
+So, while this project attempts to be usable for the featured models and the most common hardware setups, I ask you, if you have access to coding agents, to consider using coding agents as an interface to discover the project, make modifications, create personalized setups. This way you can likely do more than what we ship, and certain things that are not documented or implemented, and that you require, are potentially very easy to achieve.
+
+## More Documentation
+
+If you are looking for very specific things, we have other
+sub-README files. Otherwise for normal usage keep reading the
+next sections.
+
+- [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
+  guide for contributors. **Read this before sending a pull request**.
+- [QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
