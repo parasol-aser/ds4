@@ -104,8 +104,8 @@ next sections.
 
 ## Model Weights
 
-This implementation only works with the DeepSeek V4 and GLM GGUFs listed
-below. It is not a general GGUF loader, and arbitrary GGUF files will not have
+This implementation only works with the DeepSeek V4, GLM, and Qwen3.8 GGUFs
+listed below. It is not a general GGUF loader, and arbitrary GGUF files will not have
 the tensor layout, quantization mix, metadata, or optional MTP state expected by
 the engine. The 2 bit quantizations provided here are verified to be actually
 high quality: they behave well, work under coding agents, call tools in a reliable way.
@@ -347,6 +347,64 @@ Q2 needs the same SSD-streaming options as text inference:
 In two-Mac tensor parallel mode, pass the same `--vision` file on both the
 coordinator and worker; the coordinator encodes the image and sends the
 projected visual tokens to the worker.
+
+## Qwen3.8 27B
+
+Qwen3.8 27B is a dense hybrid model: 48 Gated DeltaNet (linear attention)
+layers interleaved with 16 gated GQA attention layers, a 5120-wide residual
+stream, and a 248k vocabulary. DwarfStar runs the stock Unsloth GGUFs from
+[unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)
+on Metal, including the mixed-recipe `UD-*` files (Q3_K, Q4_K, Q5_K, Q6_K,
+IQ4_NL, IQ4_XS, and IQ3_S tensors):
+
+```sh
+./download_model.sh qwen38-q8     # Qwen3.8-27B-Q8_0.gguf, about 27 GiB
+./download_model.sh qwen38-q4km   # Qwen3.8-27B-UD-Q4_K_M.gguf, about 15.3 GiB
+```
+
+The Q8_0 file is the exactness control: its prefill logits match llama.cpp
+to four decimals. The `UD-Q4_K_M` file is the everyday choice on 32 GB and
+larger Macs. A pure Q4_K recipe built with `llama-quantize --pure` and the
+Unsloth imatrix runs on the fastest matvec path if you want a few more
+tokens per second at slightly lower quality.
+
+```sh
+./ds4 -m gguf/Qwen3.8-27B-UD-Q4_K_M.gguf -c 32768 -p "Explain the Gated DeltaNet update rule."
+./ds4 -m gguf/Qwen3.8-27B-UD-Q4_K_M.gguf -c 32768            # interactive REPL
+./ds4-server -m gguf/Qwen3.8-27B-UD-Q4_K_M.gguf -c 65536     # OpenAI/Anthropic API, model id qwen3.8-27b
+./ds4-agent -m gguf/Qwen3.8-27B-UD-Q4_K_M.gguf -c 65536      # native coding agent
+```
+
+Notes:
+
+- Thinking is on by default, as in the Qwen chat template. `--nothink` on
+  the CLI, or `thinking: {type: disabled}` / `think: false` in API requests,
+  primes the answer with an empty thinking block instead.
+- The server and the agent speak Qwen's native tool-call format
+  (`<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`),
+  mapped to OpenAI and Anthropic tool calls like the other families.
+- The recurrent DeltaNet state only moves forward. Extending a conversation
+  reuses the live session; rewriting an earlier turn rebuilds the prefix.
+- Context up to the model's 262144 tokens is supported. The attention KV
+  cache costs 64 KiB per token (16 layers of f16 K and V); the DeltaNet state
+  is a fixed 150 MiB per session.
+- Only the plain Metal graph path is implemented for this family: no CUDA,
+  SSD streaming, distributed, tensor-parallel, MTP, or vision support yet.
+
+Measured on a Mac Studio M2 Ultra (192 GB), greedy, short prompt:
+
+| File | Prefill (1439 tokens) | Generation | llama.cpp generation |
+| --- | ---: | ---: | ---: |
+| Q8_0 | 295 t/s | 23.5 t/s | 20.4 t/s |
+| UD-Q4_K_M | 261 t/s | 28.0 t/s | 23.1 t/s |
+| pure Q4_K | 271 t/s | 33.1 t/s | 23.8 t/s |
+| pure Q4_0 | 271 t/s | 33.6 t/s | 28.4 t/s |
+
+The pure Q4_K and Q4_0 decode paths fuse each layer's projections into single
+launches (qkv|z|alpha|beta, q|k|v, gate/up SwiGLU), fold every residual add
+into the following RMSNorm, and stream the weights at about 620 GB/s on the
+wide matvecs. They apply whenever the tensors involved are Q4_K or Q4_0, so
+they also cover most of a `UD-Q4_K_M` file.
 
 ## DSpark Speculative Decoding
 

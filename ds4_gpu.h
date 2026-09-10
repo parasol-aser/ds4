@@ -3252,6 +3252,122 @@ int ds4_gpu_glm53_kda_prefill(
         float                 gate_lower_bound,
         float                 norm_eps);
 
+/* Qwen3.5 Gated DeltaNet.  qkv holds the fused [q | k | v] projections on
+ * entry and the SiLU'd convolution output on return; alpha/beta are the raw
+ * per-head gate projections for every token.  conv_state ([3][channels]) and
+ * recurrent_state ([v_heads][128][128]) stay FP32 and advance in place.
+ * Serves decode (n_tokens = 1) and prefill. */
+int ds4_gpu_qwen35_gdn_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *qkv,
+        const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_w_offset,
+        uint64_t              a_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              norm_offset,
+        uint32_t              n_v_heads,
+        uint32_t              n_qk_heads,
+        uint32_t              n_tokens,
+        float                 eps);
+
+/* Qwen3.5 attention prologue in one launch: per-head RMSNorm + NEOX RoPE on
+ * the leading n_rot dims of 256 for the n_head query heads (into the f32
+ * scratch q_out) and the n_head_kv key heads (into the f16 K cache at row
+ * cache_row0), plus the V rows copied into the f16 V cache.  q rows
+ * interleave [q | gate] per head, hence q_head_stride; k/v sources are
+ * addressed with their own row strides.  Token 0 sits at RoPE position pos0. */
+int ds4_gpu_qwen35_attn_prologue_tensor(
+        ds4_gpu_tensor       *q_out,
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        const ds4_gpu_tensor *q_src,
+        const ds4_gpu_tensor *k_src,
+        const ds4_gpu_tensor *v_src,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_norm_offset,
+        uint64_t              k_norm_offset,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              q_row_stride,
+        uint32_t              q_head_stride,
+        uint32_t              k_row_stride,
+        uint32_t              v_row_stride,
+        uint32_t              cache_row0,
+        uint32_t              pos0,
+        uint32_t              n_rot,
+        float                 freq_base,
+        float                 eps);
+
+/* 4-bit decode helpers (weight_type is the GGUF tensor type, Q4_K or Q4_0),
+ * one launch each: fused mid = silu(gate . x) * (up . x) for n_tok <= 8
+ * columns, a Q4_K-only K-split matvec for long-row shapes (single column,
+ * out_dim a multiple of 4), and a multi-weight matvec (up to 4 segments,
+ * single column) writing the segment outputs back to back; every segment
+ * row count must be a multiple of 4 (Q4_K) or 8 (Q4_0). */
+int ds4_gpu_qwen35_gate_up_swiglu_q4_tensor(
+        ds4_gpu_tensor       *mid,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint32_t              weight_type,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
+
+int ds4_gpu_qwen35_matmul_q4_K_ksplit_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_qwen35_matmul_q4_multi_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint32_t              weight_type,
+        const uint64_t       *offsets,
+        const uint64_t       *rows,
+        uint32_t              n_seg,
+        uint64_t              in_dim,
+        const ds4_gpu_tensor *x);
+
+/* heads[t][h][256] *= sigmoid(gate) with the gate read from the [q | gate]
+ * projection rows. */
+int ds4_gpu_qwen35_attn_gate_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *qg,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              qg_row_stride);
+
+/* Causal GQA attention over the [pos][kv_head][256] f16 caches for queries
+ * at positions [pos0, pos0 + n_tokens).  cache_len = pos0 + n_tokens keys are
+ * visible.  n_tokens = 1 runs the split-KV decode kernel. */
+int ds4_gpu_qwen35_attention_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              head_dim);
+
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
  * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving
  * fork's per-layer decode graph capture.  The key identifies a captured

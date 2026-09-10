@@ -367,6 +367,7 @@ static bool is_rendered_chat_prompt(const char *prompt) {
         "<|user|>",
         "<|assistant|>",
         "<|observation|>",
+        "<|im_start|>",
     };
     if (!prompt) return false;
     for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
@@ -534,7 +535,15 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
 static void cli_apply_model_sampling_defaults(
         ds4_engine             *engine,
         cli_generation_options *gen) {
-    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
+    if (!engine || !gen) return;
+    if (ds4_engine_is_qwen35(engine)) {
+        /* Qwen3.8 model card: temperature 1.0, top-p 0.95, min-p 0. */
+        if (!gen->temperature_set) gen->temperature = 1.0f;
+        if (!gen->top_p_set) gen->top_p = 0.95f;
+        if (!gen->min_p_set) gen->min_p = 0.0f;
+        return;
+    }
+    if (!ds4_engine_is_glm_dsa(engine)) return;
 
     if (!gen->temperature_set) gen->temperature = 1.0f;
     if (!gen->top_p_set) gen->top_p = 0.95f;

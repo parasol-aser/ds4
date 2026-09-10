@@ -27771,6 +27771,81 @@ extern "C" int ds4_gpu_glm53_kda_decode(
     return cuda_ok(cudaGetLastError(), "GLM-5.3 KDA decode launch");
 }
 
+/* Qwen3.5 kernels are Metal-only for now; the engine refuses the CUDA
+ * backend for that family, so these only satisfy the link. */
+extern "C" int ds4_gpu_qwen35_gdn_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *conv_state,
+        ds4_gpu_tensor *recurrent_state, ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *z, const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta, const void *model_map, uint64_t model_size,
+        uint64_t conv_w_offset, uint64_t a_offset, uint64_t dt_bias_offset,
+        uint64_t norm_offset, uint32_t n_v_heads, uint32_t n_qk_heads,
+        uint32_t n_tokens, float eps) {
+    (void)out; (void)conv_state; (void)recurrent_state; (void)qkv; (void)z;
+    (void)alpha; (void)beta; (void)model_map; (void)model_size;
+    (void)conv_w_offset; (void)a_offset; (void)dt_bias_offset; (void)norm_offset;
+    (void)n_v_heads; (void)n_qk_heads; (void)n_tokens; (void)eps;
+    return 0;
+}
+
+extern "C" int ds4_gpu_qwen35_attn_prologue_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *key_cache, ds4_gpu_tensor *value_cache,
+        const ds4_gpu_tensor *q_src, const ds4_gpu_tensor *k_src, const ds4_gpu_tensor *v_src,
+        const void *model_map, uint64_t model_size, uint64_t q_norm_offset,
+        uint64_t k_norm_offset, uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv,
+        uint32_t q_row_stride, uint32_t q_head_stride, uint32_t k_row_stride,
+        uint32_t v_row_stride, uint32_t cache_row0, uint32_t pos0, uint32_t n_rot,
+        float freq_base, float eps) {
+    (void)q_out; (void)key_cache; (void)value_cache; (void)q_src; (void)k_src; (void)v_src;
+    (void)model_map; (void)model_size; (void)q_norm_offset; (void)k_norm_offset;
+    (void)n_tokens; (void)n_head; (void)n_head_kv; (void)q_row_stride; (void)q_head_stride;
+    (void)k_row_stride; (void)v_row_stride; (void)cache_row0; (void)pos0; (void)n_rot;
+    (void)freq_base; (void)eps;
+    return 0;
+}
+
+extern "C" int ds4_gpu_qwen35_attn_gate_tensor(
+        ds4_gpu_tensor *heads, const ds4_gpu_tensor *qg, uint32_t n_tokens,
+        uint32_t n_head, uint32_t qg_row_stride) {
+    (void)heads; (void)qg; (void)n_tokens; (void)n_head; (void)qg_row_stride;
+    return 0;
+}
+
+extern "C" int ds4_gpu_qwen35_gate_up_swiglu_q4_tensor(
+        ds4_gpu_tensor *mid, const void *model_map, uint64_t model_size, uint32_t weight_type,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    (void)mid; (void)model_map; (void)model_size; (void)weight_type; (void)gate_offset; (void)up_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
+    return 0;
+}
+
+extern "C" int ds4_gpu_qwen35_matmul_q4_K_ksplit_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t offset,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x) {
+    (void)out; (void)model_map; (void)model_size; (void)offset; (void)in_dim; (void)out_dim; (void)x;
+    return 0;
+}
+
+extern "C" int ds4_gpu_qwen35_matmul_q4_multi_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint32_t weight_type,
+        const uint64_t *offsets, const uint64_t *rows, uint32_t n_seg, uint64_t in_dim,
+        const ds4_gpu_tensor *x) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_type; (void)offsets; (void)rows; (void)n_seg;
+    (void)in_dim; (void)x;
+    return 0;
+}
+
+extern "C" int ds4_gpu_qwen35_attention_tensor(
+        ds4_gpu_tensor *heads, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *key_cache, const ds4_gpu_tensor *value_cache,
+        uint32_t pos0, uint32_t n_tokens, uint32_t cache_cap, uint32_t n_head,
+        uint32_t n_head_kv, uint32_t head_dim) {
+    (void)heads; (void)q; (void)key_cache; (void)value_cache; (void)pos0;
+    (void)n_tokens; (void)cache_cap; (void)n_head; (void)n_head_kv; (void)head_dim;
+    return 0;
+}
+
 extern "C" int ds4_gpu_glm53_kda_prefill(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,

@@ -2049,6 +2049,332 @@ void dequantize_dense_q4_K_t4(device const ds4_dense_block_q4_K *xb, short il, t
     }
 }
 
+
+/*
+ * Extra GGUF quant types for mixed-recipe dense checkpoints (for example the
+ * Unsloth UD Qwen3.8 files): Q4_1, Q3_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, IQ3_S.
+ * The dequantizers follow ggml-metal (MIT); il indexes the 16-element quad
+ * within a block for the 4x4 forms and the 4-element chunk for the t4 forms.
+ */
+struct ds4_dense_block_q4_1 {
+    half d;
+    half m;
+    uchar qs[16];
+};
+
+struct ds4_dense_block_q3_K {
+    uchar hmask[32];
+    uchar qs[64];
+    uchar scales[12];
+    half d;
+};
+
+struct ds4_dense_block_q5_K {
+    half d;
+    half dmin;
+    uchar scales[12];
+    uchar qh[32];
+    uchar qs[128];
+};
+
+struct ds4_dense_block_q6_K {
+    uchar ql[128];
+    uchar qh[64];
+    char scales[16];
+    half d;
+};
+
+struct ds4_dense_block_iq4_nl {
+    half d;
+    uchar qs[16];
+};
+
+struct ds4_dense_block_iq4_xs {
+    half d;
+    ushort scales_h;
+    uchar scales_l[4];
+    uchar qs[128];
+};
+
+struct ds4_dense_block_iq3_s {
+    half d;
+    uchar qs[64];
+    uchar qh[8];
+    uchar signs[32];
+    uchar scales[4];
+};
+
+static constant float ds4_dense_kvalues_iq4nl[16] = {
+    -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
+    1.f, 13.f, 25.f, 38.f, 53.f, 69.f, 89.f, 113.f,
+};
+
+static constant uchar ds4_dense_kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+
+static constant uint ds4_dense_iq3s_grid[512] = {
+    0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
+    0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
+    0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
+    0x01010f0f, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030b,
+    0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
+    0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
+    0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
+    0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501, 0x01070505,
+    0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05, 0x01070d0f, 0x01070f03,
+    0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
+    0x01090907, 0x01090b03, 0x01090f01, 0x010b0105, 0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d,
+    0x010b0707, 0x010b0903, 0x010b090b, 0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303,
+    0x010d0307, 0x010d0703, 0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501,
+    0x010f0505, 0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
+    0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501, 0x03010505,
+    0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03, 0x03010f05, 0x03030101,
+    0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
+    0x03030903, 0x03030b01, 0x03030b05, 0x03030f01, 0x03030f0d, 0x03050101, 0x03050305, 0x0305030b,
+    0x0305030f, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01,
+    0x03050f05, 0x03070103, 0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f,
+    0x03070701, 0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
+    0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09, 0x030b0103,
+    0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03, 0x030d0501, 0x030d0509,
+    0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107, 0x030f0301, 0x030f0305, 0x030f0503,
+    0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01, 0x05010101, 0x05010103, 0x05010107, 0x0501010b,
+    0x0501010f, 0x05010301, 0x05010305, 0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f,
+    0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f,
+    0x05010f01, 0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
+    0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103, 0x05050109,
+    0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903, 0x05050b07, 0x05050b0f,
+    0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b, 0x05070303, 0x05070505, 0x05070509,
+    0x05070703, 0x05070707, 0x05070905, 0x05070b01, 0x05070d0d, 0x05090103, 0x0509010f, 0x05090501,
+    0x05090507, 0x05090705, 0x0509070b, 0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303,
+    0x050b0505, 0x050b070f, 0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f,
+    0x050d0503, 0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
+    0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505, 0x07010703,
+    0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03, 0x07010d07, 0x07010f03,
+    0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030d01,
+    0x07030f05, 0x07030f0d, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050b01,
+    0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903,
+    0x07070907, 0x0707090f, 0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505,
+    0x07090703, 0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
+    0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103, 0x070f0107,
+    0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
+    0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01, 0x09030105, 0x0903010f, 0x09030303,
+    0x09030307, 0x09030505, 0x09030701, 0x0903070b, 0x09030907, 0x09030b03, 0x09030b0b, 0x09050103,
+    0x09050107, 0x09050301, 0x0905030b, 0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05,
+    0x09050f01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b,
+    0x09090101, 0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
+    0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b, 0x090f0701,
+    0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505, 0x0b010901, 0x0b010909,
+    0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103, 0x0b030107, 0x0b03010b, 0x0b030305,
+    0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101, 0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d,
+    0x0b050b07, 0x0b070105, 0x0b07010f, 0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b,
+    0x0b070f07, 0x0b090103, 0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d,
+    0x0b0b0b03, 0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
+    0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f, 0x0d030d09,
+    0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01, 0x0d070101, 0x0d070309,
+    0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05, 0x0d0b0101, 0x0d0b0107, 0x0d0b0709,
+    0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303, 0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f,
+    0x0f010501, 0x0f010505, 0x0f01070d, 0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303,
+    0x0f030509, 0x0f030907, 0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503,
+    0x0f050701, 0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
+    0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
+};
+
+template <typename type4x4>
+void dequantize_dense_q4_1(device const ds4_dense_block_q4_1 *xb, short il, thread type4x4 &reg) {
+    device const ushort *qs = ((device const ushort *)xb + 2);
+    const float d1 = il ? (xb->d / 16.h) : xb->d;
+    const float d2 = d1 / 256.f;
+    const float m = xb->m;
+    const ushort mask0 = il ? 0x00F0 : 0x000F;
+    const ushort mask1 = mask0 << 8;
+    float4x4 reg_f;
+    for (int i = 0; i < 8; i++) {
+        reg_f[i/2][2*(i%2) + 0] = ((qs[i] & mask0) * d1) + m;
+        reg_f[i/2][2*(i%2) + 1] = ((qs[i] & mask1) * d2) + m;
+    }
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4>
+void dequantize_dense_q4_1_t4(device const ds4_dense_block_q4_1 *xb, short il, thread type4 &reg) {
+    device const ushort *qs = ((device const ushort *)xb + 2);
+    const float d1 = (il/4) ? (xb->d / 16.h) : xb->d;
+    const float d2 = d1 / 256.f;
+    const float m = xb->m;
+    const ushort mask0 = (il/4) ? 0x00F0 : 0x000F;
+    const ushort mask1 = mask0 << 8;
+    for (int i = 0; i < 2; i++) {
+        reg[2*i + 0] = d1 * (qs[2*(il%4) + i] & mask0) + m;
+        reg[2*i + 1] = d2 * (qs[2*(il%4) + i] & mask1) + m;
+    }
+}
+
+template <typename type4x4>
+void dequantize_dense_q3_K(device const ds4_dense_block_q3_K *xb, short il, thread type4x4 &reg) {
+    const half d_all = xb->d;
+    device const uchar *q = (device const uchar *)xb->qs;
+    device const uchar *h = (device const uchar *)xb->hmask;
+    device const char *scales = (device const char *)xb->scales;
+
+    q = q + 32 * (il/8) + 16 * (il&1);
+    h = h + 16 * (il&1);
+    uchar m = 1 << (il/2);
+    ushort kmask1 = (il/4)>1 ? ((il/4)>2 ? 192 : 48) : ((il/4)>0 ? 12 : 3);
+    ushort kmask2 = il/8 ? 0xF0 : 0x0F;
+    ushort scale_2 = scales[il%8], scale_1 = scales[8 + il%4];
+    short dl_int = (il/4)&1 ? (scale_2&kmask2) | ((scale_1&kmask1) << 2)
+                            : (scale_2&kmask2) | ((scale_1&kmask1) << 4);
+    float dl = il<8 ? d_all * (dl_int - 32.f) : d_all * (dl_int / 16.f - 32.f);
+    const float ml = 4.f * dl;
+
+    il = (il/2) & 3;
+    const half coef = il>1 ? (il>2 ? 1/64.h : 1/16.h) : (il>0 ? 1/4.h : 1.h);
+    const uchar mask = il>1 ? (il>2 ? 192 : 48) : (il>0 ? 12 : 3);
+    dl *= coef;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl * (q[i] & mask) - (h[i] & m ? 0 : ml);
+    }
+}
+
+template <typename type4x4>
+void dequantize_dense_q5_K(device const ds4_dense_block_q5_K *xb, short il, thread type4x4 &reg) {
+    device const uchar *q = xb->qs;
+    device const uchar *qh = xb->qh;
+
+    short is = (il/4) * 2;
+    q = q + 32 * (il/4) + 16 * (il&1);
+    qh = qh + 16 * (il&1);
+    uchar ul = 1 << (il/2);
+    il = il & 3;
+    const uchar2 sc = ds4_dense_q4_K_scale_min(is, il/2, xb->scales);
+    const float d = il < 2 ? xb->d : xb->d / 16.f;
+    const float min = xb->dmin;
+    const float dl = d * sc[0];
+    const float ml = min * sc[1];
+
+    const ushort mask = il<2 ? 0x0F : 0xF0;
+    const float qh_val = il<2 ? 16.f : 256.f;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl * ((q[i] & mask) + (qh[i] & ul ? qh_val : 0)) - ml;
+    }
+}
+
+template <typename type4x4>
+void dequantize_dense_q6_K(device const ds4_dense_block_q6_K *xb, short il, thread type4x4 &reg) {
+    const half d_all = xb->d;
+    device const ushort *ql = (device const ushort *)xb->ql;
+    device const ushort *qh = (device const ushort *)xb->qh;
+    device const char *scales = (device const char *)xb->scales;
+
+    ql = ql + 32*(il/8) + 16*((il/2)&1) + 8*(il&1);
+    qh = qh + 16*(il/8) + 8*(il&1);
+    float sc = scales[(il%2) + 2 * ((il/2))];
+    il = (il/2) & 3;
+
+    const uint kmask1 = il>1 ? (il>2 ? 0xC0C0C0C0 : 0x30303030) : (il>0 ? 0x0C0C0C0C : 0x03030303);
+    const uint kmask2 = il>1 ? 0xF0F0F0F0 : 0x0F0F0F0F;
+    const float ml = d_all * sc * 32.f;
+    const float dl0 = d_all * sc;
+    const float dl1 = dl0 / 256.f;
+    const float dl2 = dl0 / (256.f * 256.f);
+    const float dl3 = dl0 / (256.f * 256.f * 256.f);
+    const uchar shr_h = il>2 ? 2 : 0;
+    const uchar shl_h = il>1 ? 0 : (il>0 ? 2 : 4);
+    const uchar shr_l = il>1 ? 4 : 0;
+    for (int i = 0; i < 4; ++i) {
+        const uint low = (ql[2*i] | (uint)(ql[2*i+1] << 16)) & kmask2;
+        const uint high = (qh[2*i] | (uint)(qh[2*i+1] << 16)) & kmask1;
+        const uint q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+        reg[i][0] = dl0 * ((half)(q & 0xFF)) - ml;
+        reg[i][1] = dl1 * ((float)(q & 0xFF00)) - ml;
+        reg[i][2] = dl2 * ((float)(q & 0xFF0000)) - ml;
+        reg[i][3] = dl3 * ((float)(q & 0xFF000000)) - ml;
+    }
+}
+
+template <typename type4x4>
+void dequantize_dense_iq4_nl(device const ds4_dense_block_iq4_nl *xb, short il, thread type4x4 &reg) {
+    device const ushort *q4 = (device const ushort *)xb->qs;
+    const float d = xb->d;
+    uint aux32;
+    thread const uchar *q8 = (thread const uchar *)&aux32;
+    for (int i = 0; i < 4; ++i) {
+        aux32 = ((q4[2*i] | (q4[2*i+1] << 16)) >> 4*il) & 0x0f0f0f0f;
+        reg[i][0] = d * ds4_dense_kvalues_iq4nl[q8[0]];
+        reg[i][1] = d * ds4_dense_kvalues_iq4nl[q8[1]];
+        reg[i][2] = d * ds4_dense_kvalues_iq4nl[q8[2]];
+        reg[i][3] = d * ds4_dense_kvalues_iq4nl[q8[3]];
+    }
+}
+
+template <typename type4>
+void dequantize_dense_iq4_nl_t4(device const ds4_dense_block_iq4_nl *xb, short il, thread type4 &reg) {
+    device const ushort *q4 = (device const ushort *)xb->qs;
+    const float d = xb->d;
+    uint aux32;
+    thread const uchar *q8 = (thread const uchar *)&aux32;
+    aux32 = ((q4[2*(il%4)] | (q4[2*(il%4)+1] << 16)) >> 4*(il/4)) & 0x0f0f0f0f;
+    reg[0] = d * ds4_dense_kvalues_iq4nl[q8[0]];
+    reg[1] = d * ds4_dense_kvalues_iq4nl[q8[1]];
+    reg[2] = d * ds4_dense_kvalues_iq4nl[q8[2]];
+    reg[3] = d * ds4_dense_kvalues_iq4nl[q8[3]];
+}
+
+template <typename type4x4>
+void dequantize_dense_iq4_xs(device const ds4_dense_block_iq4_xs *xb, short il, thread type4x4 &reg) {
+    const int ib32 = il/2;
+    il = il%2;
+    device const uint *q4 = (device const uint *)xb->qs + 4*ib32;
+    const int ls = ((xb->scales_l[ib32/2] >> 4*(ib32%2)) & 0xf) | (((xb->scales_h >> 2*ib32) & 3) << 4);
+    const float d = (float)xb->d * (ls - 32);
+    uint aux32;
+    thread const uchar *q8 = (thread const uchar *)&aux32;
+    for (int i = 0; i < 4; ++i) {
+        aux32 = (q4[i] >> 4*il) & 0x0f0f0f0f;
+        reg[i][0] = d * ds4_dense_kvalues_iq4nl[q8[0]];
+        reg[i][1] = d * ds4_dense_kvalues_iq4nl[q8[1]];
+        reg[i][2] = d * ds4_dense_kvalues_iq4nl[q8[2]];
+        reg[i][3] = d * ds4_dense_kvalues_iq4nl[q8[3]];
+    }
+}
+
+template <typename type4x4>
+void dequantize_dense_iq3_s(device const ds4_dense_block_iq3_s *xb, short il, thread type4x4 &reg) {
+    const float d = xb->d;
+    const int ib32 = il/2;
+    il = il%2;
+    device const uchar *qs = xb->qs + 8*ib32;
+    device const uchar *signs = xb->signs + 4*ib32 + 2*il;
+    const uchar qh = xb->qh[ib32] >> 4*il;
+    const float dl = d * (1 + 2*((xb->scales[ib32/2] >> 4*(ib32%2)) & 0xf));
+    constant uchar *grid1 = (constant uchar *)(ds4_dense_iq3s_grid + (qs[4*il+0] | ((qh << 8) & 256)));
+    constant uchar *grid2 = (constant uchar *)(ds4_dense_iq3s_grid + (qs[4*il+1] | ((qh << 7) & 256)));
+    for (int i = 0; i < 4; ++i) {
+        reg[0][i] = dl * grid1[i] * select(1, -1, signs[0] & ds4_dense_kmask_iq2xs[i+0]);
+        reg[1][i] = dl * grid2[i] * select(1, -1, signs[0] & ds4_dense_kmask_iq2xs[i+4]);
+    }
+    grid1 = (constant uchar *)(ds4_dense_iq3s_grid + (qs[4*il+2] | ((qh << 6) & 256)));
+    grid2 = (constant uchar *)(ds4_dense_iq3s_grid + (qs[4*il+3] | ((qh << 5) & 256)));
+    for (int i = 0; i < 4; ++i) {
+        reg[2][i] = dl * grid1[i] * select(1, -1, signs[1] & ds4_dense_kmask_iq2xs[i+0]);
+        reg[3][i] = dl * grid2[i] * select(1, -1, signs[1] & ds4_dense_kmask_iq2xs[i+4]);
+    }
+}
+
+#define DS4_DENSE_DEQ_T4_FROM_4X4(name, block_t) \
+template <typename type4> \
+void name##_t4(device const block_t *xb, short il, thread type4 &reg) { \
+    float4x4 tmp; \
+    name(xb, il / 4, tmp); \
+    const short row = il & 3; \
+    for (int i = 0; i < 4; i++) reg[i] = tmp[row][i]; \
+}
+DS4_DENSE_DEQ_T4_FROM_4X4(dequantize_dense_q3_K, ds4_dense_block_q3_K)
+DS4_DENSE_DEQ_T4_FROM_4X4(dequantize_dense_q5_K, ds4_dense_block_q5_K)
+DS4_DENSE_DEQ_T4_FROM_4X4(dequantize_dense_q6_K, ds4_dense_block_q6_K)
+DS4_DENSE_DEQ_T4_FROM_4X4(dequantize_dense_iq4_xs, ds4_dense_block_iq4_xs)
+DS4_DENSE_DEQ_T4_FROM_4X4(dequantize_dense_iq3_s, ds4_dense_block_iq3_s)
+#undef DS4_DENSE_DEQ_T4_FROM_4X4
+
 // DS4 small-batch mat-vec kernel used for 2..8 prompt tokens.
 template<short r1ptg, typename q_t, short chpb, void (*deq_t4)(device const q_t *, short, thread float4 &) >
 void kernel_mul_mv_ext_q4_f32_impl(
@@ -2342,6 +2668,41 @@ template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_3")]] kernel mul_mv_ext_q4_f
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
 
+template [[host_name("kernel_mul_mv_ext_q4_1_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, ds4_dense_block_q4_1, 32, dequantize_dense_q4_1_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_1_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, ds4_dense_block_q4_1, 32, dequantize_dense_q4_1_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_1_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, ds4_dense_block_q4_1, 32, dequantize_dense_q4_1_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_1_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, ds4_dense_block_q4_1, 32, dequantize_dense_q4_1_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_1_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, ds4_dense_block_q4_1, 32, dequantize_dense_q4_1_t4>;
+template [[host_name("kernel_mul_mv_ext_q3_K_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, ds4_dense_block_q3_K, 256, dequantize_dense_q3_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q3_K_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, ds4_dense_block_q3_K, 256, dequantize_dense_q3_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q3_K_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, ds4_dense_block_q3_K, 256, dequantize_dense_q3_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q3_K_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, ds4_dense_block_q3_K, 256, dequantize_dense_q3_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q3_K_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, ds4_dense_block_q3_K, 256, dequantize_dense_q3_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, ds4_dense_block_q5_K, 256, dequantize_dense_q5_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, ds4_dense_block_q5_K, 256, dequantize_dense_q5_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, ds4_dense_block_q5_K, 256, dequantize_dense_q5_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, ds4_dense_block_q5_K, 256, dequantize_dense_q5_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q5_K_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, ds4_dense_block_q5_K, 256, dequantize_dense_q5_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, ds4_dense_block_q6_K, 256, dequantize_dense_q6_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, ds4_dense_block_q6_K, 256, dequantize_dense_q6_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, ds4_dense_block_q6_K, 256, dequantize_dense_q6_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, ds4_dense_block_q6_K, 256, dequantize_dense_q6_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, ds4_dense_block_q6_K, 256, dequantize_dense_q6_K_t4>;
+template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, ds4_dense_block_iq4_nl, 32, dequantize_dense_iq4_nl_t4>;
+template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, ds4_dense_block_iq4_nl, 32, dequantize_dense_iq4_nl_t4>;
+template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, ds4_dense_block_iq4_nl, 32, dequantize_dense_iq4_nl_t4>;
+template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, ds4_dense_block_iq4_nl, 32, dequantize_dense_iq4_nl_t4>;
+template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, ds4_dense_block_iq4_nl, 32, dequantize_dense_iq4_nl_t4>;
+template [[host_name("kernel_mul_mv_ext_iq4_xs_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, ds4_dense_block_iq4_xs, 256, dequantize_dense_iq4_xs_t4>;
+template [[host_name("kernel_mul_mv_ext_iq4_xs_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, ds4_dense_block_iq4_xs, 256, dequantize_dense_iq4_xs_t4>;
+template [[host_name("kernel_mul_mv_ext_iq4_xs_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, ds4_dense_block_iq4_xs, 256, dequantize_dense_iq4_xs_t4>;
+template [[host_name("kernel_mul_mv_ext_iq4_xs_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, ds4_dense_block_iq4_xs, 256, dequantize_dense_iq4_xs_t4>;
+template [[host_name("kernel_mul_mv_ext_iq4_xs_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, ds4_dense_block_iq4_xs, 256, dequantize_dense_iq4_xs_t4>;
+template [[host_name("kernel_mul_mv_ext_iq3_s_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, ds4_dense_block_iq3_s, 256, dequantize_dense_iq3_s_t4>;
+template [[host_name("kernel_mul_mv_ext_iq3_s_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, ds4_dense_block_iq3_s, 256, dequantize_dense_iq3_s_t4>;
+template [[host_name("kernel_mul_mv_ext_iq3_s_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, ds4_dense_block_iq3_s, 256, dequantize_dense_iq3_s_t4>;
+template [[host_name("kernel_mul_mv_ext_iq3_s_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, ds4_dense_block_iq3_s, 256, dequantize_dense_iq3_s_t4>;
+template [[host_name("kernel_mul_mv_ext_iq3_s_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, ds4_dense_block_iq3_s, 256, dequantize_dense_iq3_s_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
@@ -2913,3 +3274,10 @@ template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<h
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_q4_1_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_1, 2, dequantize_dense_q4_1, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_q3_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q3_K, 16, dequantize_dense_q3_K, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_q5_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q5_K, 16, dequantize_dense_q5_K, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_q6_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q6_K, 16, dequantize_dense_q6_K, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_iq4_nl_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_iq4_nl, 2, dequantize_dense_iq4_nl, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_iq4_xs_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_iq4_xs, 16, dequantize_dense_iq4_xs, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_iq3_s_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_iq3_s, 16, dequantize_dense_iq3_s, float, float4x4, float, float2x4>;

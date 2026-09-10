@@ -30,6 +30,9 @@ GLM53_Q2_FILE="GLM-5.3-Flash-Q2.gguf"
 GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"
 GLM53_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
 GLM53_VISION_FILE="GLM-5.3-Flash-Vision-Encoder.gguf"
+QWEN38_REPO="unsloth/Qwen3.8-27B-GGUF"
+QWEN38_Q8_FILE="Qwen3.8-27B-Q8_0.gguf"
+QWEN38_Q4KM_FILE="Qwen3.8-27B-UD-Q4_K_M.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -65,6 +68,8 @@ Usage:
   ./download_model.sh glm53-full-q2 [--token TOKEN]
   ./download_model.sh glm53-q2 [--token TOKEN]
   ./download_model.sh glm53-q4 [--token TOKEN]
+  ./download_model.sh qwen38-q8 [--token TOKEN]
+  ./download_model.sh qwen38-q4km [--token TOKEN]
   ./download_model.sh glm53-fp8 [--token TOKEN]
   ./download_model.sh glm53-vision [--token TOKEN]
 
@@ -162,6 +167,14 @@ Targets:
        Text-only GLM 5.3 Flash native FP8 GGUF, about 305 GiB on disk. It
        preserves the released weights without requantization. DwarfStar
        inference support for this paired FP8-code/scale format is pending.
+
+  qwen38-q8
+       Qwen3.8 27B Q8_0 GGUF from Unsloth, about 27 GiB on disk. The
+       exactness reference for the Qwen3.8 graph.
+
+  qwen38-q4km
+       Qwen3.8 27B Unsloth UD-Q4_K_M GGUF, about 15.3 GiB on disk. The
+       everyday Qwen3.8 file for 32 GB and larger Macs.
 
   glm53-vision
        GLM 5.3 Flash vision encoder, about 1.1 GB on disk. Load it separately
@@ -290,6 +303,18 @@ case "$MODEL" in
     glm53-vision)
         REPO=$GLM53_REPO
         MODEL_FILE=$GLM53_VISION_FILE
+        FORCE_HF_DOWNLOAD=1
+        LINK_MODEL=0
+        ;;
+    qwen38-q8)
+        REPO=$QWEN38_REPO
+        MODEL_FILE=$QWEN38_Q8_FILE
+        FORCE_HF_DOWNLOAD=1
+        LINK_MODEL=0
+        ;;
+    qwen38-q4km)
+        REPO=$QWEN38_REPO
+        MODEL_FILE=$QWEN38_Q4KM_FILE
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
         ;;

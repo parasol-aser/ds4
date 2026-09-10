@@ -1,8 +1,9 @@
 # Agent Notes
 
-`ds4.c` is a DeepSeek V4 Flash specific inference engine. It is not a generic
-GGUF runner. The goal is a small, readable, high-performance C codebase with
-Objective-C only where Metal requires it and Metal kernels under `metal/`.
+`ds4.c` is a model-specific inference engine for DeepSeek V4 Flash/Pro,
+GLM 5.2/5.3 Flash, and Qwen3.8 27B. It is not a generic GGUF runner. The goal
+is a small, readable, high-performance C codebase with Objective-C only where
+Metal requires it and Metal kernels under `metal/`.
 
 ## Goals
 
@@ -36,14 +37,22 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 - `ds4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue, streaming,
   tool-call mapping, disk KV cache policy.
 - `ds4_metal.m`: Objective-C Metal runtime and kernel wrappers.
-- `metal/*.metal`: compute kernels.
-- `tests/`: unit and live integration tests.
+- `metal/*.metal`: compute kernels. `metal/qwen35.metal` holds the Qwen3.5
+  Gated DeltaNet and gated-attention prologue kernels; the mixed-recipe quant
+  matvecs (Q3_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS/IQ3_S) and the Q4_K decode kernels
+  (fused gate/up SwiGLU, K-split, multi-weight) live in `metal/moe.metal`.
+  Decode-tuning switches for those paths: `DS4_METAL_Q4K_KSPLIT_{NSG,NR0}`,
+  `DS4_METAL_Q4K_MULTI_{NR0,NSG}`, `DS4_METAL_QWEN_FA_NWG`, `DS4_QWEN_DISABLE_{FAST_MV,MULTI_PROJ,FUSED_SWIGLU,FUSED_NORM}`.
+  `DS4_METAL_DECODE_STAGE_PROFILE=1` with `DS4_METAL_CB_TIMES=1` prints per-stage
+  GPU spans; `DS4_GLM_LOGIT_DUMP` plus `DS4_QWEN_LOGIT_DUMP_STEP=k` dumps the
+  logits of the k-th forward for reference comparison.
 - Sampler note: ds4.c is built with `-ffast-math` on Darwin, which implies
   finite-math-only. `isfinite()` there is a slow libm call and an exponent-bit
   test on a float value gets folded to "true"; test the bits loaded from
   memory (`sample_finite(const float *)`) and keep the vocabulary scans
   branch-free so they vectorize. `DS4_TOKEN_TIMING=1` on the CLI prints the
   per-token CPU split (sample / emit / eval).
+- `tests/`: unit and live integration tests.
 - `misc/`: ignored notes, experiments, and old planning material.
 
 This list is not complete, check the files for more info.
