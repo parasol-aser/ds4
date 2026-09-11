@@ -1,0 +1,8 @@
+==========
+
+
+DwarfStar is a specialized, self-contained inference engine built on llama.cpp and GGML that optimizes the execution of specific large language models like DeepSeek V4 and GLM 5.x on high-memory consumer and server hardware. It supports multiple backends including Metal, CUDA, and ROCm, and features
+==========
+Prompt: 1449 tokens, 221.756 tokens-per-sec
+Generation: 64 tokens, 33.332 tokens-per-sec
+Peak memory: 17.528 GB

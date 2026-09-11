@@ -1,0 +1,16 @@
+[23:53:17] headline Q4 done
+[23:54:29] headline Q40 done
+[23:55:57] headline UD done
+[23:57:49] headline Q8 done
+[23:58:26] mlx short done
+[00:13:12] context rep 1 done
+[00:29:39] context rep 2 done
+[00:44:25] context rep 3 done
+[00:45:42] ablation done
+[00:46:23] stage profiles done
+[00:51:48] ppl/prefill Q4 done
+[00:56:37] ppl/prefill Q40 done
+[01:02:13] ppl/prefill UD done
+[01:07:32] ppl/prefill Q8 done
+[01:26:40] ALL DONE
+CHAIN DONE

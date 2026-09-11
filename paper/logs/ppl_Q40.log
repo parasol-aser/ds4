@@ -1,0 +1,25 @@
+0.00.529.492 W model has unused tensor blk.64.attn_norm.weight (size = 20480 bytes) -- ignoring
+0.00.529.503 W model has unused tensor blk.64.post_attention_norm.weight (size = 20480 bytes) -- ignoring
+0.00.529.510 W model has unused tensor blk.64.attn_q.weight (size = 35389440 bytes) -- ignoring
+0.00.529.513 W model has unused tensor blk.64.attn_k.weight (size = 2949120 bytes) -- ignoring
+0.00.529.515 W model has unused tensor blk.64.attn_v.weight (size = 2949120 bytes) -- ignoring
+0.00.529.522 W model has unused tensor blk.64.attn_output.weight (size = 17694720 bytes) -- ignoring
+0.00.529.524 W model has unused tensor blk.64.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.00.529.526 W model has unused tensor blk.64.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.00.529.528 W model has unused tensor blk.64.ffn_gate.weight (size = 50135040 bytes) -- ignoring
+0.00.529.530 W model has unused tensor blk.64.ffn_down.weight (size = 50135040 bytes) -- ignoring
+0.00.529.532 W model has unused tensor blk.64.ffn_up.weight (size = 50135040 bytes) -- ignoring
+0.00.529.536 W model has unused tensor blk.64.nextn.eh_proj.weight (size = 29491200 bytes) -- ignoring
+0.00.529.538 W model has unused tensor blk.64.nextn.enorm.weight (size = 20480 bytes) -- ignoring
+0.00.529.540 W model has unused tensor blk.64.nextn.hnorm.weight (size = 20480 bytes) -- ignoring
+0.00.529.547 W model has unused tensor blk.64.nextn.shared_head_norm.weight (size = 20480 bytes) -- ignoring
+0.01.220.376 I cmn          init: llama threadpool init, n_threads = 16
+0.01.298.810 I 
+0.01.298.834 I system_info: n_threads = 16 (n_threads_batch = 16) / 24 | MTL : EMBED_LIBRARY = 1 | CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | MATMUL_INT8 = 1 | DOTPROD = 1 | ACCELERATE = 1 | REPACK = 1 | 
+0.01.298.839 I perplexity: tokenizing the input ..
+0.01.548.007 I perplexity: tokenization took 249.162 ms
+0.01.548.078 I perplexity: calculating perplexity over 40 chunks, n_ctx=2048, batch_size=2048, n_seq=1
+0.08.448.029 I perplexity: 6.90 seconds per pass - ETA 4.58 minutes
+[1]5.3565,[2]6.2538,[3]6.4115,[4]6.4221,[5]6.3862,[6]5.5181,[7]5.2016,[8]5.2115,[9]5.5570,[10]5.6323,[11]5.6834,[12]5.9238,[13]5.9742,[14]6.0313,[15]6.0709,[16]6.4303,[17]6.4743,[18]6.5604,[19]6.5064,[20]6.2992,[21]6.3177,[22]6.3330,[23]6.3644,[24]6.3686,[25]6.4352,[26]6.4057,[27]6.5337,[28]6.6082,[29]6.6122,[30]6.5807,[31]6.5037,[32]6.4033,[33]6.3649,[34]6.3556,[35]6.3590,[36]6.3584,[37]6.2551,[38]6.1832,[39]6.1156,[40]6.0291,
+4.36.852.307 I Final estimate: PPL = 6.0291 +/- 0.07223
+

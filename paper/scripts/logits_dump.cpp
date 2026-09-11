@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
     if (!model) { fprintf(stderr, "load failed\n"); return 1; }
     const llama_vocab *vocab = llama_model_get_vocab(model);
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = 8192; cp.n_batch = 2048; cp.n_ubatch = 2048; cp.n_threads = 8; cp.n_threads_batch = 8;
+    cp.n_ctx = 16384; cp.n_batch = 2048; cp.n_ubatch = 2048; cp.n_threads = 8; cp.n_threads_batch = 8;
     llama_context *ctx = llama_init_from_model(model, cp);
     std::vector<llama_token> toks(prompt.size() + 16);
     int n = llama_tokenize(vocab, prompt.c_str(), (int)prompt.size(), toks.data(), (int)toks.size(), false, true);
@@ -43,8 +43,12 @@ int main(int argc, char **argv) {
     printf("tokens(%d):", n);
     for (int i = 0; i < n; i++) printf(" %d", toks[i]);
     printf("\n");
-    llama_batch batch = llama_batch_get_one(toks.data(), n);
-    if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "decode failed\n"); return 1; }
+    // prefill in n_batch-sized chunks so long prompts work
+    for (int i0 = 0; i0 < n; i0 += 2048) {
+        int len = std::min(2048, n - i0);
+        llama_batch batch = llama_batch_get_one(toks.data() + i0, len);
+        if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "decode failed at %d\n", i0); return 1; }
+    }
     const int n_vocab = llama_vocab_n_tokens(vocab);
     std::vector<llama_token> out;
     for (int step = 0; step < n_predict + 1; step++) {

@@ -1,0 +1,14 @@
+ds4: Metal device Apple M2 Ultra, 192.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.454 ms, residency requested in 102.158 ms, warmup 1.812 ms (mapped 15691.23 MiB from offset 10.49 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.25 GiB (raw 0.25 + compressed 0.00) + buffers 0.15 GiB + resident model 15.32 GiB = 15.72 GiB planned
+ds4: memory detail: ctx=4096 prefill_cap=2048 raw_kv_rows=4096 compressed_kv_rows=0 backend=metal
+ds4: memory: KV 0.25 GiB (raw 0.25 + compressed 0.00) + buffers 0.15 GiB = 0.40 GiB context
+ds4: memory detail: ctx=4096 prefill_cap=2048 raw_kv_rows=4096 compressed_kv_rows=0 backend=metal
+ds4: Qwen graph ctx=4096 prefill_chunk=2048 attention_layers=16 kv_cache=0.25 GiB recurrent_layers=48 state=149.6 MiB
+processing 20 input tokens: 20/20 (100.0%)
+ds4: per-token cpu split: sample 0.414 ms, emit 0.008 ms, eval 37.204 ms (temp 1.000 top_p 0.950 min_p 0.000)
+ds4: prefill: 72.80 t/s, generation: 27.00 t/s

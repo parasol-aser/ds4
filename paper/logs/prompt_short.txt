@@ -1,0 +1,7 @@
+<|im_start|>user
+Write a short paragraph about the ocean.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

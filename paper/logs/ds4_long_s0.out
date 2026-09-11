@@ -1,0 +1,1 @@
+DwarfStar is a specialized, self-contained native inference engine optimized for running DeepSeek V4 Flash and GLM models on high-memory consumer hardware, supporting backends like Metal, CUDA, and ROCm. It features first-class support for SSD streaming to execute models larger than available RAM and offers multi-GPU capabilities that

@@ -1,0 +1,1 @@
+DwarfStar is a specialized, beta-quality native inference engine optimized for specific open-weight models like DeepSeek V4 and GLM 5.x, supporting Metal, CUDA, and ROCm backends with features such as SSD streaming and multi-GPU parallelism. Built upon the foundations of llama.cpp and GGML,

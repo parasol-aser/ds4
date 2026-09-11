@@ -1,0 +1,10 @@
+all optimizations on & 30.80 $\pm$ 0.04 &  \\
+no fused gate/up SwiGLU & 32.86 $\pm$ 0.01 & +2.06 \\
+no multi-weight projections & 32.14 $\pm$ 0.10 & +1.34 \\
+no vectorized single-weight matvec & 31.65 $\pm$ 0.03 & +0.85 \\
+no K-split (FFN down) & 31.70 $\pm$ 0.07 & +0.90 \\
+fixed 32 split-KV workgroups & 30.95 $\pm$ 0.02 & +0.15 \\
+no fused residual+norm & 30.92 $\pm$ 0.12 & +0.12 \\
+multi-weight kernel, 2 rows/simdgroup & 30.69 $\pm$ 0.03 & -0.11 \\
+ggml-style Q4\_K matvecs, generic fusions & 34.64 $\pm$ 0.01 & +3.84 \\
+all off & 34.97 $\pm$ 0.01 & +4.17 \\%

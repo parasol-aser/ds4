@@ -1,0 +1,78 @@
+ds4: Metal device Apple M2 Ultra, 192.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.465 ms, residency requested in 102.805 ms, warmup 1.798 ms (mapped 15691.23 MiB from offset 10.49 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.25 GiB (raw 0.25 + compressed 0.00) + buffers 0.15 GiB + resident model 15.32 GiB = 15.72 GiB planned
+ds4: memory detail: ctx=4096 prefill_cap=2048 raw_kv_rows=4096 compressed_kv_rows=0 backend=metal
+ds4: memory: KV 0.25 GiB (raw 0.25 + compressed 0.00) + buffers 0.15 GiB = 0.40 GiB context
+ds4: memory detail: ctx=4096 prefill_cap=2048 raw_kv_rows=4096 compressed_kv_rows=0 backend=metal
+ds4: using GPU graph generation with graph prefill
+ds4: using GLM full-attention argmax generation path
+ds4: Qwen graph ctx=4096 prefill_chunk=2048 attention_layers=16 kv_cache=0.25 GiB recurrent_layers=48 state=149.6 MiB
+processing 20 input tokens: 20/20 (100.0%)
+ds4: GLM decode eval 1 took 37.846 ms
+ds4: GLM decode eval 2 took 36.929 ms
+ds4: GLM decode eval 3 took 36.892 ms
+ds4: GLM decode eval 4 took 36.927 ms
+ds4: GLM decode eval 5 took 36.891 ms
+ds4: GLM decode eval 6 took 36.770 ms
+ds4: GLM decode eval 7 took 36.918 ms
+ds4: GLM decode eval 8 took 36.880 ms
+ds4: GLM decode eval 9 took 37.176 ms
+ds4: GLM decode eval 10 took 36.839 ms
+ds4: GLM decode eval 11 took 36.990 ms
+ds4: GLM decode eval 12 took 36.438 ms
+ds4: GLM decode eval 13 took 37.080 ms
+ds4: GLM decode eval 14 took 37.048 ms
+ds4: GLM decode eval 15 took 37.086 ms
+ds4: GLM decode eval 16 took 37.053 ms
+ds4: GLM decode eval 17 took 37.104 ms
+ds4: GLM decode eval 18 took 37.011 ms
+ds4: GLM decode eval 19 took 37.096 ms
+ds4: GLM decode eval 20 took 37.065 ms
+ds4: GLM decode eval 21 took 37.090 ms
+ds4: GLM decode eval 22 took 37.056 ms
+ds4: GLM decode eval 23 took 37.089 ms
+ds4: GLM decode eval 24 took 37.032 ms
+ds4: GLM decode eval 25 took 37.070 ms
+ds4: GLM decode eval 26 took 37.158 ms
+ds4: GLM decode eval 27 took 37.071 ms
+ds4: GLM decode eval 28 took 37.037 ms
+ds4: GLM decode eval 29 took 37.179 ms
+ds4: GLM decode eval 30 took 37.128 ms
+ds4: GLM decode eval 31 took 37.135 ms
+ds4: GLM decode eval 32 took 37.112 ms
+ds4: GLM decode eval 33 took 36.983 ms
+ds4: GLM decode eval 34 took 37.210 ms
+ds4: GLM decode eval 35 took 37.115 ms
+ds4: GLM decode eval 36 took 37.089 ms
+ds4: GLM decode eval 37 took 37.121 ms
+ds4: GLM decode eval 38 took 37.032 ms
+ds4: GLM decode eval 39 took 37.134 ms
+ds4: GLM decode eval 40 took 37.681 ms
+ds4: GLM decode eval 41 took 37.139 ms
+ds4: GLM decode eval 42 took 37.084 ms
+ds4: GLM decode eval 43 took 37.042 ms
+ds4: GLM decode eval 44 took 36.486 ms
+ds4: GLM decode eval 45 took 37.666 ms
+ds4: GLM decode eval 46 took 37.393 ms
+ds4: GLM decode eval 47 took 37.394 ms
+ds4: GLM decode eval 48 took 37.369 ms
+ds4: GLM decode eval 49 took 37.395 ms
+ds4: GLM decode eval 50 took 37.513 ms
+ds4: GLM decode eval 51 took 37.394 ms
+ds4: GLM decode eval 52 took 37.370 ms
+ds4: GLM decode eval 53 took 37.398 ms
+ds4: GLM decode eval 54 took 37.504 ms
+ds4: GLM decode eval 55 took 37.386 ms
+ds4: GLM decode eval 56 took 37.469 ms
+ds4: GLM decode eval 57 took 37.504 ms
+ds4: GLM decode eval 58 took 37.510 ms
+ds4: GLM decode eval 59 took 37.349 ms
+ds4: GLM decode eval 60 took 37.421 ms
+ds4: GLM decode eval 61 took 37.416 ms
+ds4: GLM decode eval 62 took 37.406 ms
+ds4: GLM decode eval 63 took 37.372 ms
+ds4: GLM prefill: 73.25 t/s, generation: 27.27 t/s

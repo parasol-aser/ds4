@@ -18,7 +18,7 @@ for c in range(n_chunks):
     tgt = chunk[0, 1:]
     tok_lp = mx.take_along_axis(logp, tgt[:, None], axis=-1)[:, 0]
     half = n_ctx // 2
-    sel = tok_lp[half - 1:]                    # predictions for positions >= half
+    sel = tok_lp[half:]                        # targets at positions half+1 .. n_ctx-1, as llama-perplexity
     nll -= float(mx.sum(sel)); count += sel.shape[0]
     mx.eval(logits)
     if (c + 1) % 5 == 0:

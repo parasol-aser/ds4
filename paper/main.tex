@@ -6,8 +6,11 @@
 \usepackage{xcolor}
 \usepackage{microtype}
 \usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{decorations.pathreplacing}
 \usepackage[hidelinks]{hyperref}
 \lstset{basicstyle=\ttfamily\footnotesize,breaklines=true,columns=fullflexible,keepspaces=true}
+\makeatletter\newcommand{\tabinput}[1]{\@@input #1 }\makeatother % primitive input: safe inside tabular
 \newcommand{\tps}{t/s}
 \newcommand{\ds}{\textsc{ds4}}
 \newcommand{\upstreamurl}{\url{https://github.com/antirez/ds4}}
@@ -23,154 +26,155 @@
 
 \begin{abstract}
 Large language models are increasingly run on personal machines, and Apple
-silicon with unified memory is one of the few consumer platforms that holds a
-25--100B-parameter model in a single address space. Single-stream decode on
-such a machine is usually described as memory-bandwidth bound: every token
-reads every weight, so throughput should be bandwidth divided by model bytes.
-Yet the most widely used runner reaches 45\% of that bound on Qwen3.8-27B in
-Q4\_K on an M2~Ultra, and 58\% of the streaming rate the GPU actually
-achieves. This paper asks where the rest of the token goes. We decompose a
-decode token into weight streaming, matvec kernel efficiency, per-dispatch
-overhead and CPU work between tokens, using command-buffer GPU timestamps so
-that sub-millisecond kernels are attributed correctly, and we find that at
-this scale each of the last three costs milliseconds. Working inside \ds{}, an
-open-source model-specific C/Metal engine, we add the model and then pull
-three levers, each behind a runtime switch so it can be ablated: fewer bytes
-per token, fewer and better-shaped dispatches, and a shorter CPU path between
-tokens. Decode rises from 29.3 to 33.1~\tps{} (llama.cpp: 23.8), 81\% of the
-streaming ceiling, with logits that match llama.cpp at an arbitrary decode
-step. Two results reach beyond this engine. A controlled experiment with the
-same weights in Q4\_0 and Q4\_K shows that the block format is worth 7--19\%
-with simple kernels and 1--2\% once the large matvecs are fused, because both
-formats then stream at the same ceiling; MLX reaches that ceiling on its
-affine 4-bit format without any model-specific fusion. And a 2~ms-per-token
-cost hiding in the sampler, caused by \texttt{isfinite} under
-\texttt{-ffast-math}, shows that the CPU gap between tokens has to be measured
-on its own. We report three optimizations that did not help and why, and
-release the code, switches and scripts.
+silicon with unified memory holds a 25--100B-parameter model in one address
+space. Single-stream decode there is usually called memory-bandwidth bound,
+yet a widely used runner spends 42~ms per decode step on Qwen3.8-27B in
+Q4\_K on an M2~Ultra, against an estimated 24~ms to stream the active
+weights at the best rates the GPU achieves.
+We ask where the rest goes. We decompose a decode step into weight streaming,
+matvec kernel efficiency, per-dispatch overhead and CPU work between tokens,
+timing stages with command-buffer GPU timestamps so that sub-millisecond
+kernels are attributed correctly, and we find that each of the last three
+costs milliseconds at this scale. Inside \ds{}, an open-source model-specific
+C/Metal engine, we add the model and pull three levers, each behind a runtime
+switch: fewer bytes per token, fewer and better-shaped dispatches, and a
+shorter CPU path between tokens. Our optimizations shorten the step from
+35.0 to 30.8~ms; forward-only, \ds{} takes 30.6~ms against llama.cpp's 42.3,
+with logits matching llama.cpp at nine decode-step and context-length points.
+A controlled experiment with the same source checkpoint in Q4\_0 and Q4\_K
+shows the block format is worth 8--16\% with simple kernels and 2--3\% once
+the large matvecs are fused; MLX reaches a comparable step time on its affine
+4-bit conversion. A 2~ms-per-token cost in the sampler,
+caused by \texttt{isfinite} under \texttt{-ffast-math}, shows that the CPU
+gap between tokens must be measured on its own. We report negative results
+with their mechanisms and release code, switches, logs and scripts.
 \end{abstract}
 
 \section{Introduction}
+\label{sec:intro}
 
-Open-weight models in the 20--30B range now fit comfortably on a laptop or
-desktop with 64--192~GB of unified memory, and people run them locally for
-chat, coding agents and private workloads. On these machines the question is
-no longer whether a model fits but how fast it decodes, and the standard
-answer is a roofline argument: a decode step must read every weight once, so
-tokens per second is bounded by memory bandwidth over model bytes. For
-Qwen3.8-27B in Q4\_K, 15~GB per token on an M2~Ultra with 800~GB/s nominal,
-that bound is 53~\tps{}; the fastest kernel on this GPU streams at 670~GB/s,
-which puts the practical ceiling at 41~\tps{}. llama.cpp decodes the model at
-23.8~\tps{} (\S\ref{sec:eval}). More than half of every token is something
-other than moving weights.
+Open-weight models in the 20--30B range fit on a laptop or desktop with
+64--192~GB of unified memory, and people run them locally for chat, coding
+agents and private workloads. The question on such a machine is no longer
+whether a model fits but how fast it decodes, and the standard answer is a
+roofline argument: a single-stream decode step reads every active weight
+matrix once, so the step time is bounded below by model bytes over memory
+bandwidth. For Qwen3.8-27B in Q4\_K on an M2~Ultra that is 15.05~GB per step
+at a nominal 800~GB/s, or 18.8~ms; using the streaming rates we measure for
+each format on this GPU, about 24.3~ms (\S\ref{sec:roofline}). llama.cpp takes
+42.3~ms per decode step (\S\ref{sec:eval}). Roughly 18~ms of every step is
+not accounted for by streaming the weights, and this paper is about where it
+goes.
 
-That half is hard to see, which is why it persists. A profiler that
+That time is hard to see, which is why it persists. A profiler that
 synchronizes at stage boundaries pays about 0.16~ms per boundary on this
 machine, more than most of the kernels it is trying to measure, so small
 kernels vanish into the floor. A system trace reports the GPU 96--98\% busy
-for both llama.cpp and our engine, which sounds like the roofline has been
-reached; it has not, because a kernel that is running is not a kernel that is
-streaming at full rate. And a 2~ms cost per token in the CPU sampler, one
-seventh of the GPU time, is invisible to every GPU-side tool. The first
-contribution of this paper is a way of measuring that makes each of these
-visible: per-stage GPU timestamps from the command buffers, a CPU
-inter-token split, and reference logits at an arbitrary decode step so that
-every change is checked where decode actually runs.
+for both llama.cpp and our engine, which sounds as if the roofline were
+reached; it is not, because a kernel that is running is not necessarily a
+kernel that is streaming at full rate. And a 2~ms cost per token in the CPU
+sampler, one fifteenth of the step, is invisible to every GPU-side tool. Our
+first contribution is an instrument that makes each of these visible: GPU
+timestamps of the command buffer for each stage, a CPU inter-token split, and
+reference logits from llama.cpp at chosen decode steps, so that every change
+is checked where decode actually runs (\S\ref{sec:method}).
 
-With that instrument we pull three levers inside \ds{}, an open-source
-model-specific engine written in C and Metal, after adding the model to it.
-The levers are the bytes per token and how fast they move (the quantization
-format and the matvec inner loop), the number and shape of dispatches per
-token (fusing a layer's four side projections into one launch, the SwiGLU
-gate and up into one kernel, each residual add into the norm that consumes
-it, and scaling split-KV attention to the context), and the CPU path between
-tokens. Each lever has a switch, so the final build can reproduce any subset
-and switching everything off reproduces the original 29.2~\tps{} exactly.
-The result is 33.1~\tps{}, 81\% of the ceiling.
+With that instrument we add the model to \ds{}, an open-source model-specific
+engine in C and Metal, and pull three levers, each behind a switch so the final
+build can reproduce any subset (\S\ref{sec:opt}): the bytes per step and how
+fast they move (quantization format and matvec inner loop); the number and
+shape of dispatches (a layer's four side projections in one launch, the
+SwiGLU gate and up in one kernel, each residual add fused into the norm that
+consumes it, and split-KV attention scaled to the context); and the CPU path
+between tokens. Switching everything off reproduces the pre-optimization
+build (35.0~ms per step in the generation-loop definition of
+\S\ref{sec:method}); everything on gives 30.8~ms, or 30.6~ms forward-only,
+about 80\% of the estimated streaming bound.
 
-Four findings are, we think, more useful than the speedup.
-\begin{itemize}
-\item \textbf{At 27B scale, dispatch count is a first-order term.} The
-  original graph issued about 1,070 dispatches per token; at a few
-  microseconds of ramp and drain each, that is as much time as the recurrence,
-  the attention and every norm together. Fusion is worth 3.9~\tps{} on its
-  own.
-\item \textbf{The matvec limiter is activation traffic, not occupancy.}
-  Splitting reductions across more threads (K-split) did nothing for the wide
-  projections; reading the activation once per four rows instead of two, and
-  reading it as vectors, did. The Q4\_K kernels end at 613~GB/s against
-  670~GB/s for Q8\_0, and the difference is dequantization work.
-\item \textbf{Format and fusion are not additive.} With simple kernels the
-  cheaper Q4\_0 block format is worth 19\% in llama.cpp and 7\% in \ds{};
-  with fused kernels it is worth 1--2\%, because both formats then stream at
-  the same ceiling. MLX, a general framework with no model-specific graph,
-  reaches that ceiling on its affine 4-bit format. Which lever matters depends
-  on how far the kernels already are from the ceiling.
-\item \textbf{The CPU is on the critical path.} The 2~ms sampler cost was an
-  \texttt{isfinite} call left as a library function by \texttt{-ffast-math};
-  the first fix was folded away by the same flags and broke NaN handling. Both
-  facts are general to any inference code built that way.
-\end{itemize}
-
-Our contributions are:
+Our contributions, and what we learned from each:
 \begin{enumerate}
-\item A measurement method for Metal decode that attributes token time to
-  weight streaming, matvec efficiency, per-dispatch overhead and CPU gaps,
-  with a correctness protocol at arbitrary decode steps (\S\ref{sec:method},
-  \S\ref{sec:correctness}).
-\item Qwen3.8-27B support in a model-specific engine, and a set of decode
-  optimizations each measured in isolation and each behind a switch
-  (\S\ref{sec:opt}, Table~\ref{tab:ablation}).
-\item A controlled quantization-format experiment on identical weights, in
-  two engines and at two fusion levels (\S\ref{sec:q40}), and a comparison
-  with MLX across context lengths (\S\ref{sec:eval}).
-\item Negative results with mechanisms (\S\ref{sec:negative}), a profile of a
-  mixture-of-experts model on the same instrument, and the code, switches
-  and scripts.
+\item \textbf{A measurement method for Metal decode} with matched timing
+  definitions across engines and a correctness protocol at arbitrary decode
+  steps (\S\ref{sec:method}, \S\ref{sec:correctness}). The per-dispatch cost
+  it exposes is a first-order term at 27B scale: the original graph issued
+  about 1,070 dispatches per step, comparable in time to the recurrence,
+  the attention and every norm together.
+\item \textbf{Qwen3.8-27B support and a set of decode optimizations}, each
+  measured in isolation (\S\ref{sec:opt}, Figure~\ref{fig:ablation}). Their
+  leave-one-out effects are consistent with activation traffic, not
+  occupancy, limiting the Q4\_K matvecs: spreading a reduction over more
+  threads did nothing for the wide projections, while reading the activation
+  once per four rows instead of two, as vectors, did.
+\item \textbf{A controlled quantization-format experiment}
+  (\S\ref{sec:q40}) with the same source checkpoint in Q4\_0 and Q4\_K, in
+  two engines and at two kernel-fusion levels. The format is worth 16\% in
+  llama.cpp and 8\% in \ds{} with simple kernels, and 2--3\% once the large
+  matvecs are fused; which lever matters depends on how far the kernels are
+  from the streaming bound. MLX, on its affine 4-bit conversion with a
+  smaller output head, reaches a comparable step time from a general
+  framework.
+\item \textbf{The CPU path as a measured term} (\S\ref{sec:cpu}). A 2~ms
+  sampler cost came from \texttt{isfinite} being left as a library call under
+  \texttt{-ffast-math}; a first replacement was folded away by the same flags
+  and broke NaN handling. llama.cpp's own full-vocabulary top-$p$ sampler
+  costs 1.2~ms per token on the same distribution.
+\item \textbf{Negative results with mechanisms} (\S\ref{sec:negative}), a
+  profile of a mixture-of-experts model on the same instrument, and the
+  code, switches, logs and scripts (Appendix~\ref{sec:repro}).
 \end{enumerate}
 
 \ds{} (DwarfStar) is by Salvatore Sanfilippo and contributors~\cite{ds4}
-(\upstreamurl{}); it implements a handful of architectures as hand-written
-graphs rather than interpreting a generic GGUF computation graph. Our work
-adds Qwen3.8-27B, including its Gated DeltaNet and gated-attention kernels,
-and the decode paths and measurements described here; the branches and
-experiment scripts are at \branchurl{}. \S\ref{sec:discussion} argues that the
-model-specific trade is the right one for the small set of models people
-actually run locally.
+(\upstreamurl{}). It implements a handful of architectures as hand-written
+Metal schedules rather than interpreting a generic GGUF computation graph; by
+``model-specific'' we mean that the per-token dispatch list is written for the
+model, so fusions that depend on the model or the session are local changes.
+Our work adds Qwen3.8-27B, including its Gated DeltaNet and gated-attention
+kernels, and the decode paths and measurements described here; the branches,
+scripts and logs are at \branchurl{}.
 
 \section{Background}
 \label{sec:background}
 
-\subsection{Platform}
+\subsection{Platform and setup}
 The M-series SoCs share one LPDDR5 pool between CPU and GPU. Metal compiles
-kernels at runtime from Metal Shading Language and executes them from command
-buffers; a compute encoder can hold many dispatches, which execute serially with
-memory ordering. There is no host-to-device copy, but the CPU and the GPU share
-bandwidth, and the CPU-side work between two tokens is on the critical path.
+kernels at runtime and executes them from command buffers; a compute encoder
+holds many dispatches, which execute in order with memory ordering. There is
+no host-to-device copy, but the CPU and the GPU share bandwidth, and CPU work
+between two tokens is on the critical path.
 
 All measurements are on a Mac Studio with an M2~Ultra (24 CPU cores, 60 GPU
-cores, 192~GB LPDDR5, 800~GB/s nominal) running macOS 26.1 with Apple clang 17.
-Baselines are llama.cpp at commit \texttt{6d9c82ea2} (2026-09-09) with its
-Metal backend~\cite{llamacpp}, and mlx-lm 0.31.3~\cite{mlxlm}. All GGUF
-engines read the same files from the Unsloth release~\cite{unslothdynamic};
-MLX uses the community 4-bit conversion of the same checkpoint.
+cores, 192~GB LPDDR5, 800~GB/s nominal), macOS 26.1, Apple clang 17.0.0
+(clang-1700.4.4.1). Baselines are llama.cpp at commit
+\texttt{6d9c82ea2bb34e277c0664b8dd3434bfb4dcfb27} (2026-09-09) built with its
+Metal backend~\cite{llamacpp}, and mlx-lm 0.31.3 on mlx 0.32.2~\cite{mlxlm}.
+The GGUF engines read the same files from the Unsloth release (revision
+\texttt{4ca7207}~\cite{unslothdynamic}); MLX uses the community 4-bit
+conversion (revision \texttt{3e6447f}) of the same checkpoint (revision
+\texttt{1d4bf0f}~\cite{qwen35}). Appendix~\ref{sec:repro} lists file hashes.
 
 \subsection{Model}
-Qwen3.8-27B (GGUF architecture \texttt{qwen35}) is a dense hybrid of 64
-layers~\cite{qwen35}. In three layers out of four the token mixer is Gated
-DeltaNet~\cite{yang2025gateddeltanet}: one fused projection produces $q$, $k$
-(16 heads of 128) and $v$ (48 heads of 128) that share a causal depthwise
-convolution of width 4; each value head keeps a $128\times128$ recurrent state
-updated by the delta rule with a scalar per-head decay $\exp(A\cdot
-\mathrm{softplus}(\alpha+b))$ and a write strength $\sigma(\beta)$, where
-$\alpha$ and $\beta$ come from two 48-wide projections; the output is
-RMS-normalized per head and gated by $\mathrm{SiLU}(z)$ from a 6144-wide
-projection. Every fourth layer is gated grouped-query attention: 16 query
-heads of dimension 256 with 4 KV heads, NEOX RoPE on the first 64 dimensions,
-per-head RMSNorm on $q$ and $k$, and the output multiplied by a sigmoid gate
-that is projected alongside $q$. All layers have a SwiGLU FFN of hidden size
-17408; the width is 5120 and the vocabulary has 248,320 entries.
-Table~\ref{tab:bytes} gives the bytes a decode step reads.
+Qwen3.8-27B (GGUF architecture \texttt{qwen35}) has 64 decoder layers plus
+one auxiliary multi-token-prediction block that ordinary decode does not
+execute; the GGUF therefore has 65 blocks, and the byte accounting below
+covers the 64 decoder layers, the output norm and head, and one row of the
+token embedding. In three layers out of four the token mixer is Gated
+DeltaNet~\cite{yang2025gateddeltanet}: one fused projection produces $q$ and
+$k$ (16 heads of 128) and $v$ (48 heads of 128), which pass through a causal
+depthwise convolution of width 4 followed by SiLU; $q$ and $k$ are
+L2-normalized per head and $q$ is scaled by $1/\sqrt{128}$; value head $h$
+uses query/key head $h \bmod 16$; each value head keeps a $128\times128$
+recurrent state updated by the delta rule with a scalar decay
+$\exp(A \cdot \mathrm{softplus}(\alpha + b))$, where $A = -\exp(A_{\log})$
+is a per-head parameter, $b$ a per-head bias and $\alpha$ comes from a
+48-wide projection, and a write strength $\sigma(\beta)$ from a second
+48-wide projection; the output is RMS-normalized per head and gated by
+$\mathrm{SiLU}(z)$ from a 6144-wide projection. Every fourth layer is gated
+grouped-query attention: 24 query heads of dimension 256 with 4 KV heads,
+per-head RMSNorm on $q$ and $k$, NEOX RoPE on the first 64 dimensions, and
+the output multiplied by a sigmoid gate projected alongside $q$. All layers
+have a SwiGLU FFN of hidden size 17408; the width is 5120 and the vocabulary
+has 248,320 entries. Table~\ref{tab:bytes} gives the bytes a decode step
+reads.
 
 \begin{table}[t]
 \centering
@@ -180,67 +184,98 @@ Component & Weights & Q4\_K bytes \\
 \midrule
 DeltaNet layer ($\times$48): $qkv$, $z$, $\alpha$, $\beta$, out, FFN & 383.3M & 215.6~MB \\
 Attention layer ($\times$16): $q|$gate, $k$, $v$, out, FFN & 372.3M & 209.4~MB \\
-Layers total & & 13.70~GB \\
+Decoder layers, from tensor sizes & & 13.71~GB \\
 Output head, Q8\_0 ($248320\times5120$) & 1.27B & 1.35~GB \\
 \midrule
-Per token & & 15.05~GB \\
+Per decode step & & 15.06~GB \\
 \bottomrule
 \end{tabular}
-\caption{Bytes streamed per decode token for Qwen3.8-27B in pure Q4\_K
-(0.5625~B/weight) with a Q8\_0 output head (1.0625~B/weight). The token
-embedding is read for one row only.}
+\caption{Bytes read per decode step for Qwen3.8-27B in pure Q4\_K
+(0.5625~B/weight) with a Q8\_0 output head (1.0625~B/weight), from the GGUF
+tensor sizes. Norms and biases add 20~KB; the auxiliary MTP block (239~MB) and
+the token-embedding table (715~MB, one row read) are excluded.}
 \label{tab:bytes}
 \end{table}
 
-\subsection{Roofline}
-At 15.05~GB per token the nominal bound is 53~\tps{}. The practical ceiling is
-what the GPU actually streams: the fastest kernel we observe is the Q8\_0
-output-head matvec at 670~GB/s (1.35~GB in 2.01~ms), and the fastest Q4\_K
-kernel reaches 613~GB/s. Taking 620~GB/s as achievable gives 24.3~ms per token,
-or 41~\tps{}. We use 41~\tps{} as the ceiling throughout.
+\subsection{Streaming bound}
+\label{sec:roofline}
+At 15.06~GB per step the nominal 800~GB/s bound is 18.8~ms (53~\tps{}). A
+more useful reference applies the fastest rate we measure for each format to
+its bytes: the Q8\_0 output-head matvec moves 1.35~GB in 2.01~ms (670~GB/s),
+and the fastest Q4\_K kernel, the fused gate/up projection, moves 100.3~MB in
+162.9~$\mu$s (616~GB/s). Then
+\[
+T_{\text{weights}} \approx \frac{13.71\,\text{GB}}{616\,\text{GB/s}} + \frac{1.35\,\text{GB}}{670\,\text{GB/s}} \approx 24.3\ \text{ms},
+\]
+which we call the estimated weight-streaming bound. It assumes every matrix
+shape streams at the best measured rate for its format and excludes all other
+work, so it is a bound, not a partition: kernel time below it includes weight
+traffic, and a slower kernel still spends time moving weights. Throughout,
+``utilization'' of this bound means $24.3$~ms divided by the measured step
+time.
 
 \section{Measurement method}
 \label{sec:method}
 
+\begin{figure}[t]
+\centering
+\resizebox{\linewidth}{!}{\input{figs/timeline.tex}}
+\caption{What each reported quantity covers. We report milliseconds per decode
+forward under two definitions: \emph{forward-only} (the GPU forward of one
+token) and \emph{generation loop} (forward plus sampling plus emission,
+divided by the 63 forwards of a 64-token run). Rates in \tps{} are
+$1000/\text{ms}$.}
+\label{fig:timeline}
+\end{figure}
+
+\paragraph{Timing definitions.}
+Engines count differently: a 64-token run performs 63 decode forwards, the
+first token being sampled from the prefill logits, and llama.cpp's
+\emph{eval time} excludes sampling while a generation-loop clock includes it.
+We therefore report milliseconds per decode forward under two explicit
+definitions (Figure~\ref{fig:timeline}). For \ds{} the CLI, under
+\texttt{DS4\_TOKEN\_TIMING}, reports per token the time in sampling, in
+emission and in the forward call; for llama.cpp we use its \emph{eval time}
+per run and add its \emph{sampling time} for the loop; mlx-lm reports only the
+loop. All headline numbers are means over five runs on an otherwise idle GPU
+with the model file in the page cache; standard deviations are given in the
+result set.
+
 \paragraph{Per-stage GPU spans.}
 \ds{} can close and reopen its command buffer at named stage boundaries inside
-a layer (projections, convolution and recurrence, attention, output
-projection, FFN gate/up, FFN down, residual and norm) under an environment
-switch. We time each stage with the command buffer's \texttt{GPUStartTime} and
-\texttt{GPUEndTime}. Timing the same boundaries with the CPU clock, as the
-engine's earlier profiler did, includes a synchronization of about 0.16~ms per
+a layer under an environment switch. We time each stage with the command
+buffer's \texttt{GPUStartTime} and \texttt{GPUEndTime}. Timing the same
+boundaries with the CPU clock includes a synchronization of about 0.16~ms per
 boundary, which is larger than the recurrence, the attention or any norm.
-Isolating a stage in its own command buffer still adds a fixed per-buffer cost
-of a few microseconds, so the sum over stages exceeds the unperturbed token
-time by a few percent (30.9~ms against 30.2~ms for the final build); we use the
-profile for ranking and for deltas, and unperturbed runs for throughput.
+Isolating stages costs wall-clock time (the instrumented run decodes at
+8.7~\tps{}) but the GPU spans themselves are little affected: their sum,
+31.1~ms, is within 2\% of the uninstrumented forward (30.6~ms). We use the
+profile for ranking and for deltas.
 
 \paragraph{System traces.}
 Metal System Trace (\texttt{xctrace}) records GPU busy intervals and
-command-buffer submissions process-wide; from it we take GPU busy fraction,
-GPU time per token and CPU encode time per token, for \ds{} and llama.cpp on
-the same prompt.
-
-\paragraph{CPU inter-token split.}
-The CLI generation loop reports, under a switch, the wall time per token spent
-in sampling, in token emission and in the forward call. Neither GPU view
-exposes this, and it is where the sampler cost of \S\ref{sec:cpu} was found.
+command-buffer submissions process-wide; from it we take GPU busy fraction and
+CPU encode time per token, for \ds{} and llama.cpp on the same prompt.
 
 \paragraph{Reference logits.}
 A small program on the llama.cpp API prefills a prompt, greedy-decodes, and
-writes the full logit vector at a chosen step $k$; \ds{} writes the logits of
-its $k$-th forward under a switch. We report mean and maximum absolute
-difference over the 248,320 entries and whether the argmax agrees. With greedy
-decoding on both sides the token histories are identical up to $k$ whenever the
-argmax agreed at every earlier step, so the comparison exercises the decode
-kernels, not only prefill.
+writes the full logit vector at step $k$, where step 0 is the prefill output
+and step $k$ is the output after feeding back $k$ generated tokens; \ds{}
+writes the same under a switch. We report mean and maximum absolute
+difference over the 248,320 entries, the KL divergence of the softmax
+distributions, and argmax agreement, at steps 0, 4, 16, 40 and 63 on a
+20-token prompt, at steps 0, 4 and 63 on a 1,439-token prompt, and at step 4
+on an 8,590-token prompt. With greedy decoding on both sides the histories
+are identical up to $k$ only while the argmax agreed at every earlier step,
+so we also compare the 64-token greedy outputs directly and report a step
+only when the histories still agree.
 
-\section{Anatomy of a decode token}
+\section{Anatomy of a decode step}
 \label{sec:anatomy}
 
-Table~\ref{tab:stages} is the per-stage profile of one decode token on the
-final build with every optimization switched off and on, and Figure~\ref{fig:breakdown}
-groups it. Three observations organize the rest of the paper.
+Table~\ref{tab:stages} is the per-stage profile with every optimization
+switched off and on, and Figure~\ref{fig:breakdown} groups it. Three
+observations organize the rest of the paper.
 
 \begin{table}[t]
 \centering
@@ -248,29 +283,18 @@ groups it. Three observations organize the rest of the paper.
 \begin{tabular}{llrrrrr}
 \toprule
 Layer & Stage & \multicolumn{2}{c}{Optimizations off} & \multicolumn{2}{c}{On} & On, 8.6k ctx \\
- & & $\mu$s/layer & ms/token & $\mu$s/layer & ms/token & ms/token \\
+ & & $\mu$s/layer & ms/step & $\mu$s/layer & ms/step & ms/step \\
 \midrule
-both & FFN gate/up & 196.0 & 12.54 & 163.6 & 10.47 & 10.49 \\
-both & FFN down & 111.5 & 7.14 & 94.6 & 6.05 & 6.05 \\
-DeltaNet & projections $qkv$, $z$, $\alpha$, $\beta$ & 116.0 & 5.57 & 93.6 & 4.49 & 4.50 \\
-attention & projections $q|$gate, $k$, $v$ & 95.5 & 1.53 & 81.5 & 1.30 & 1.30 \\
-DeltaNet & output norm + out projection & 45.5 & 2.19 & 47.2 & 2.27 & 2.28 \\
-attention & gate + out projection & 42.7 & 0.68 & 44.1 & 0.71 & 0.71 \\
-DeltaNet & conv + recurrence & 23.7 & 1.14 & 23.6 & 1.13 & 1.13 \\
-attention & split-KV attention (+pad, reduce) & 105.9 & 1.69 & 60.5 & 0.97 & 3.38 \\
-attention & $q$/$k$ prologue, $V$ store & 7.6 & 0.12 & 7.4 & 0.12 & 0.13 \\
-both & residual adds and norms & 28.3 & 1.82 & 21.7 & 1.39 & 1.40 \\
- & output head (Q8\_0) & & 2.01 & & 2.01 & 2.01 \\
-\midrule
- & total & & 36.43 & & 30.92 & 33.39 \\
+\tabinput{tables/stages.tex}%
+ & uninstrumented step (loop definition) & & 35.0 & & 30.8 & 32.6 \\
 \bottomrule
 \end{tabular}
-\caption{GPU time per decode token by stage, Qwen3.8-27B pure Q4\_K, M2~Ultra,
-40-token context, from the per-stage profiler on the final build. ``Off''
-disables the six switches of Table~\ref{tab:ablation}; the unswitchable
-single-launch prologue is present in both columns. The last column is the
-``on'' build at an 8,590-token context. Each stage runs in its own command
-buffer, so totals exceed the unperturbed token times (34.2 and 30.2~ms).}
+\caption{GPU span per stage, Qwen3.8-27B pure Q4\_K, M2~Ultra, averaged over
+decode positions 21--30 of the 20-token prompt (the ``8.6k'' column over
+positions 8,591--8,600 of the 8,590-token prompt). ``Off'' disables the six
+switches of \S\ref{sec:opt}; the single-launch prologue is present in both
+columns. Each stage runs in its own command buffer; the ``both'' rows give
+the per-layer value averaged over all 64 layers.}
 \label{tab:stages}
 \end{table}
 
@@ -281,51 +305,55 @@ buffer, so totals exceed the unperturbed token times (34.2 and 30.2~ms).}
 \label{fig:breakdown}
 \end{figure}
 
-\paragraph{The large matvecs are near, not at, the ceiling.}
+\paragraph{The large matvecs are near, not at, the bound.}
 The FFN gate/up pair moves 100.3~MB per layer. As two ggml-style matvecs plus
-a SwiGLU kernel it streams at 512~GB/s; fused and vectorized (\S\ref{sec:opt})
-at 613~GB/s. The 5120-output projections (FFN down, attention and DeltaNet
-output) sit at 390--450~GB/s with the ggml-style kernel. The Q8\_0 output head
-reaches 670~GB/s on the same memory system, so part of the Q4\_K deficit is the
-ALU cost of unpacking its 6-bit sub-block scales and minimums.
+a SwiGLU kernel its effective rate is 513~GB/s; fused and vectorized
+(\S\ref{sec:opt}), 616~GB/s. The 5120-output projections (FFN down, attention
+and DeltaNet output) run at 390--450~GB/s with the ggml-style kernel. The
+Q8\_0 output head reaches 670~GB/s on the same memory system. Effective rate
+is bytes over kernel time, not a measurement of DRAM traffic; the difference
+between formats is consistent with the ALU cost of unpacking Q4\_K's 6-bit
+sub-block scales and minimums, and \S\ref{sec:q40} tests that directly.
 
 \paragraph{Dispatch count matters at this scale.}
-The pre-optimization graph issued about 1,070 dispatches per token (16 per
-DeltaNet layer, 19 per attention layer, plus embedding and head); at a few
-microseconds of ramp and drain each this is 3--5~ms, as much as the
+The pre-optimization graph issued about 1,070 dispatches per step (16 per
+DeltaNet layer, 19 per attention layer, plus embedding and head). At a few
+microseconds of ramp and drain each, that is 3--5~ms, as much as the
 recurrence, the attention and all norms together. The final graph issues about
 620.
 
 \paragraph{GPU busy is not GPU useful.}
 On the mixed-recipe UD-Q4\_K\_M file, the system trace shows \ds{} at 98.3\%
 GPU busy against 95.6\% for llama.cpp, with about 1~ms of CPU encode time per
-token against 4.9~ms. Both engines keep the GPU occupied; most of the gap to
-the ceiling is inside kernels rather than between them, which is why the work
-below is mostly about kernel shape and fusion.
+token against 4.9~ms. Both engines keep the GPU occupied; the gap to the bound
+is mostly inside kernels, not between them, which is why the work below is
+mostly about kernel shape and fusion.
 
 \section{Optimizations by lever}
 \label{sec:opt}
 
-Every optimization below has an environment switch, so the final build can
-reproduce any subset. Table~\ref{tab:ablation} and Figure~\ref{fig:ablation}
-give the single-switch ablation; all switches off reproduces the original
-29.2~\tps{}.
+Six optimizations have runtime switches (Appendix~\ref{sec:repro} lists
+them); Figure~\ref{fig:ablation} and Table~\ref{tab:ablation} give their
+leave-one-out effects around the optimized build, in milliseconds per decode
+forward. Leave-one-out effects around the final build need not equal
+standalone gains from the original build, and several switches remove the
+same dispatch overhead, so they do not sum to the all-off difference.
 
 \subsection{Bytes: how fast a byte moves}
-The format fixes the byte count; the kernel decides how close to the streaming
-rate the bytes move. Two changes to the Q4\_K inner loop were worth 9.6\% on
-the fused gate/up kernel (178.6 to 162.9~$\mu$s per layer): staging the 32
-activation values a lane needs as eight \texttt{float4} loads instead of 32
-scalar loads (the activation pointer's alignment is not provable to the
-compiler, so it does not vectorize the loads itself), and loading each lane's
-two 8-byte nibble runs as \texttt{uint2} instead of four \texttt{uint16}.
-Amortizing one activation staging over four rows per simdgroup instead of two
-helped the 10240- and 12288-output projections in the stage profile and hurt
-the 5120-output ones, so the row count is chosen per shape; end to end the
-difference is within noise (Table~\ref{tab:ablation}). A K-split variant,
-which spreads one row's reduction over the simdgroups of a threadgroup and
-combines through threadgroup memory, helps only the long-row FFN down
-projection (17408 inputs: 111 to 94~$\mu$s) and is used only there.
+The format fixes the byte count; the kernel decides the effective rate. Two
+changes to the Q4\_K inner loop were worth 9.6\% on the fused gate/up kernel
+(178.6 to 162.9~$\mu$s per layer): staging the 32 activation values a lane
+needs as eight \texttt{float4} loads instead of 32 scalar loads (the
+activation pointer's alignment is not provable to the compiler, so it does not
+vectorize the loads itself), and loading each lane's two 8-byte nibble runs as
+\texttt{uint2} instead of four \texttt{uint16}. Amortizing one activation
+staging over four rows per simdgroup instead of two helped the 10240- and
+12288-output projections in the stage profile and hurt the 5120-output ones,
+so the row count is chosen per shape; end to end the difference is within
+noise. A K-split variant, which spreads one row's reduction over the
+simdgroups of a threadgroup and combines through threadgroup memory, helps
+only the long-row FFN down projection (17408 inputs: 112 to 95~$\mu$s) and is
+used only there.
 
 \subsection{Dispatches: fewer and better shaped}
 \paragraph{Multi-weight matvec.} A DeltaNet layer's four side projections
@@ -338,191 +366,167 @@ attention layer. Four launches become one, and the 48-output $\alpha$ and
 $\beta$ heads no longer each pay a dispatch.
 \paragraph{Fused gate/up SwiGLU.} One kernel streams the gate and up weights
 against one staged activation and writes $\mathrm{SiLU}(g)\cdot u$; the
-elementwise SwiGLU pass disappears and the activation is read once per four
-rows instead of once per two.
+elementwise pass disappears and the activation is read once per four rows
+instead of once per two.
 \paragraph{Residual add fused into the next norm.} Each residual add is fused
 with the RMSNorm that consumes its result, so a layer's FFN epilogue produces
-the next layer's attention-norm input and the two adds and two norms per
-layer become two kernels.
+the next layer's attention-norm input; two adds and two norms per layer become
+two kernels.
 \paragraph{Single attention prologue.} Per-head RMSNorm plus RoPE for the
-query heads (to the f32 scratch), the same for the key heads (into the f16 K
-cache) and the $V$ store are one grid with three kinds of threadgroup instead
-of three launches.
+query heads, the same for the key heads into the f16 K cache, and the $V$
+store are one grid with three kinds of threadgroup instead of three launches
+(this one has no switch).
 \paragraph{Context-scaled split-KV.} The split-KV decode attention kernel
-inherited from ggml partitions the keys over 32 workgroups and reduces their
-partial results in a second kernel. At a 40-token context 30 workgroups are
-idle and the reduce dominates. Scaling the workgroup count with the context
-length, and letting a single workgroup write its normalized output directly,
-cuts the attention stage from 106 to 61~$\mu$s per layer. This required making
-the shared reduce kernel correct for fewer than 32 workgroups, which it had
-silently assumed.
+adapted from ggml partitions the keys over 32 workgroups and reduces their
+partials in a second kernel. At a 20-token context 31 workgroups are idle and
+the reduce dominates. Scaling the workgroup count with the context length,
+and letting a single workgroup write its normalized output directly, cuts the
+attention stage from 106 to 60~$\mu$s per layer; the shared reduce kernel had
+silently assumed 32 workgroups and was made correct for fewer.
 
 \subsection{The CPU path between tokens}
 \label{sec:cpu}
-With sampling at the model card's defaults (temperature 1.0, top-$p$ 0.95, no
-top-$k$), the CLI spent 2.2~ms per token in the sampler against 30.4~ms in the
-forward call. The cost was not the softmax or the sort but
-\texttt{isfinite()} on each of the 248,320 logits: the engine is compiled with
-\texttt{-ffast-math}, which on this toolchain leaves \texttt{isfinite} as a
-library call and keeps the scan scalar at about 4~ns per element, twice per
-token. A first replacement, an exponent-bit test on the float value, was folded
-to ``always finite'' by the optimizer under the same flags, admitted NaN and
-$-\infty$ logits, and failed 1,459 unit tests. The working version tests the
-bits as loaded from memory, which the optimizer cannot classify. With the max
-scan and the top-$p$ pass then written branch-free and block-wise so they
-vectorize, a degree-5 fit of $2^x$ for the tail mass that cannot enter the
-512-entry candidate heap, and a lowering-cutoff fallback instead of a
-full-vocabulary sort, sampling costs 0.5~ms per token. The two lessons are
-general: profile the inter-token gap on the CPU, and treat fast-math flags as
-part of the numerical contract of any code that handles non-finite values.
+Sampling settings first, since they decide what the sampler has to do. The
+model's generation configuration specifies temperature 1.0, top-$p$ 0.95 and
+top-$k$ 20; llama.cpp reads these from the file's metadata and its default
+chain applied top-$k$ 20 and min-$p$ 0.05 in our runs. \ds{}'s Qwen defaults
+are temperature 1.0 and top-$p$ 0.95 with no top-$k$ and no min-$p$, so its
+sampler scans the full 248,320-entry distribution every token; this is the
+configuration studied here, and for comparison we also ran llama.cpp with
+the same settings (\texttt{--top-k 0 --min-p 0}).
+
+Under those settings the CLI spent 2.2~ms per token in \ds{}'s sampler
+against 30.5~ms in the forward. The cost was not the softmax or the sort but
+\texttt{isfinite()} on each logit, twice per token: the engine is compiled
+with \texttt{-ffast-math}, under which Apple clang 17 leaves \texttt{isfinite}
+as a call to \texttt{\_\_\_isfinitef} and the scan runs scalar at about 4~ns
+per element. A first replacement, an exponent-bit test on the float value,
+was folded to ``always finite'' by the optimizer under the same flags,
+admitted NaN and $-\infty$ logits, and failed 1,459 unit tests; the working
+version tests the bits as loaded from memory, which the optimizer does not
+classify. The finite test alone did not recover the time; the gain came from
+rewriting the max scan and the top-$p$ pass branch-free and block-wise so
+they vectorize, with a degree-5 fit of $2^x$ (relative error under $2\times
+10^{-6}$) for the tail mass that cannot enter the 512-entry candidate heap,
+and a lowering-cutoff fallback instead of a full-vocabulary sort. The sampler
+now costs 0.41~ms per token. The flags cut both ways: the same sampler built
+with \texttt{-fno-finite-math-only}, which inlines \texttt{isfinite}, costs
+0.74~ms, because the vectorized scans lose the fast-math assumptions. For
+scale, llama.cpp's sampler costs 0.13~ms per token with its default top-$k$
+20 chain and 1.21~ms with the full-vocabulary top-$p$ settings. Two lessons are general: measure the inter-token gap on the
+CPU, and treat fast-math flags as part of the numerical contract of code that
+handles non-finite values. Whether other compilers or SDK versions behave the
+same way we have not checked.
 
 \section{Correctness}
 \label{sec:correctness}
-Every change was checked against llama.cpp logits at decode step 4 on two
-prompts (Table~\ref{tab:logits}); the values are identical across all
-optimizations, and prefill logits are bit-identical between the initial and
-final builds because no prefill kernel changed.
+Table~\ref{tab:logits} compares \ds{} with llama.cpp on the same Q4\_K file at
+eight (prompt, step) points where the greedy histories still agree. The
+argmax agrees at every point and the distributions are close; the 64-token
+greedy outputs are identical on the Q4\_0, UD-Q4\_K\_M and Q8\_0 files and
+diverge at token 46 on Q4\_K, where a near-tie resolves differently (so the
+step-63 point on the 20-token prompt compares different histories and is
+omitted). The values were unchanged, to the printed
+precision, across every optimization added in \S\ref{sec:opt}; prefill
+logits are bit-identical between the initial and final builds because no
+prefill kernel changed. Two prompts and eight steps are spot checks, not a
+proof of equivalence over long generations.
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lrrrrl}
+\toprule
+Prompt & step & mean $|\Delta|$ & max $|\Delta|$ & KL & argmax \\
+\midrule
+\tabinput{tables/correctness.tex}%
+\bottomrule
+\end{tabular}
+\caption{Logit difference from llama.cpp, pure Q4\_K, over 248,320 entries;
+KL is $D(\ds{}\,\|\,\text{llama.cpp})$ of the softmax distributions.}
+\label{tab:logits}
+\end{table}
+
+\subsection{Quality of the files}
+Because both engines read the same file and agree to this precision, the
+quality of a file is a property of the quantization, not of the engine.
+Table~\ref{tab:ppl} gives wikitext-2 perplexity~\cite{merity2016pointer}, and
+because all files score the same chunks we report paired differences of the
+per-chunk loss with a chunk-level standard error, which is the informative
+statistic. Pure Q4\_K, UD-Q4\_K\_M and Q8\_0 are within 1\% of each other
+(the differences are 1--2 chunk-level standard errors, and the ordering is not
+the one bit width would predict); pure Q4\_0 and the MLX conversion are 3--4\%
+worse, at 4 standard errors for Q4\_0. Forty chunks of wikitext-2 are a
+narrow view of quality.
 
 \begin{table}[t]
 \centering
 \begin{tabular}{lrrr}
 \toprule
-Prompt & mean $|\Delta|$ & max $|\Delta|$ & argmax \\
+File & bytes/weight & PPL & paired vs pure Q4\_K \\
 \midrule
-22-token chat prompt & 0.012 & 0.179 & agrees \\
-1439-token prompt & 0.024 & 0.214 & agrees \\
-\bottomrule
-\end{tabular}
-\caption{Logit difference from llama.cpp at decode step 4, pure Q4\_K, over
-248,320 entries.}
-\label{tab:logits}
-\end{table}
-
-Because both engines read the same file and agree to this precision, the
-quality of a file is a property of the quantization, not the engine.
-Table~\ref{tab:ppl} gives wikitext-2 perplexity~\cite{merity2016pointer} per
-file. The three GGUF recipes are indistinguishable within their standard
-errors, so the 41\% decode advantage of pure Q4\_K over Q8\_0 in
-Table~\ref{tab:tps} is free on this metric; the two affine 4-bit variants
-(MLX, Q4\_0) cost 3--4\%.
-
-\begin{table}[t]
-\centering
-\begin{tabular}{lrr}
-\toprule
-File & bytes/weight & wikitext-2 PPL \\
-\midrule
-pure Q4\_K, imatrix & 0.5625 & $5.80 \pm 0.07$ \\
-UD-Q4\_K\_M & 0.58 & $5.85 \pm 0.07$ \\
-Q8\_0 & 1.0625 & $5.86 \pm 0.07$ \\
-MLX 4-bit affine, group 64 & 0.5625 & $5.98$ \\
-pure Q4\_0, imatrix & 0.5625 & $6.03 \pm 0.07$ \\
+\tabinput{tables/ppl.tex}%
 \bottomrule
 \end{tabular}
 \caption{Perplexity on the first 40 chunks of 2048 tokens of wikitext-2 test,
-scoring the second half of each chunk (\texttt{llama-perplexity} for the GGUF
-files; a script with the same chunking for the MLX model, which reports no
-standard error). Bytes per weight are for the layer tensors. The MLX
-conversion uses no importance matrix.}
+scoring positions 1025--2047 of each chunk (\texttt{llama-perplexity}; a
+script with the same chunking for the MLX model). The $\pm$ after each PPL is
+llama-perplexity's token-level standard error; the last column is the mean
+paired difference of per-chunk loss, as a percentage, with its chunk-level
+standard error. Bytes per weight are for the layer tensors.}
 \label{tab:ppl}
-\end{table}
-
-\subsection{Downstream check}
-\label{sec:downstream}
-As a coarse check on reasoning tasks we ran \ds{}'s built-in evaluation
-harness on its first ten questions (drawn from GPQA Diamond, SuperGPQA and
-AIME 2025) with thinking enabled, greedy decoding and a 2,500-token reply
-budget (Table~\ref{tab:eval}). The scores are within one question of each
-other, which is the resolution of ten items; three to four answers per file
-were cut off by the budget, so the numbers measure quantization and budget
-together. We include them for completeness, not as evidence of a difference.
-
-\begin{table}[t]
-\centering
-\begin{tabular}{lrr}
-\toprule
-File & correct / 10 & cut off by the budget \\
-\midrule
-pure Q4\_K & 8 & 3 \\
-pure Q4\_0 & 7 & 3 \\
-Q8\_0 & 7 & 4 \\
-\bottomrule
-\end{tabular}
-\caption{ds4-eval, first ten built-in questions, thinking on, 2,500-token
-reply budget, greedy.}
-\label{tab:eval}
 \end{table}
 
 \section{Evaluation}
 \label{sec:eval}
 
-\subsection{Throughput}
-Table~\ref{tab:tps} summarizes decode throughput. On pure Q4\_K,
-33.1~\tps{} is 30.2~ms per token: about 26~ms of weight streaming at
-560--620~GB/s, 2~ms for the output head, and 2--3~ms of small kernels and
-dispatch overhead; 81\% of the 41~\tps{} ceiling and 63\% of the nominal
-bound. Against llama.cpp the gain is 39\% on pure Q4\_K, 23\% on the
-mixed-recipe file (only its Q4\_K tensors take the fused paths) and 18\% on
-Q8\_0 (only the format-independent fusions apply).
+\subsection{Decode step time}
+Table~\ref{tab:tps} gives the headline comparison under both timing
+definitions. On pure Q4\_K, \ds{} takes 30.6~ms per decode forward against
+42.3 for llama.cpp, a 28\% shorter step; the estimated streaming bound of
+24.3~ms is 79\% of it. The step is about 26~ms of weight-carrying matvecs at
+390--616~GB/s effective, 2~ms for the output head, and 2--3~ms of small
+kernels and per-dispatch ramp. On the mixed-recipe file the step is 16\%
+shorter than llama.cpp's (only its Q4\_K tensors take the fused paths) and on
+Q8\_0 11\% (only the format-independent fusions apply). Sampling adds 0.4~ms
+per token in \ds{} and 0.1~ms (default chain) or 1.2~ms (full-vocabulary
+top-$p$) in llama.cpp.
 
 \begin{table}[t]
 \centering
 \small
-\begin{tabular}{llrrrrrr}
+\begin{tabular}{lrrrrrr}
 \toprule
- & & \multicolumn{3}{c}{greedy} & \multicolumn{2}{c}{sampled} & prefill \\
-Baseline & File & \ds{} before & \ds{} after & baseline & \ds{} after & baseline & \ds{} / baseline \\
+ & \multicolumn{2}{c}{\ds{} (ms/forward)} & \multicolumn{3}{c}{llama.cpp (ms/forward)} & \\
+File & forward & loop & forward & loop, default & loop, matched & prefill \ds{}/llama \\
 \midrule
-llama.cpp & pure Q4\_K & 29.3 & 33.1 & 23.8 & 32.8 & 23.8 & 268 / 266 \\
-llama.cpp & pure Q4\_0 & --- & 33.6 & 28.4 & 33.6 & --- & 289 / 304 \\
-llama.cpp & UD-Q4\_K\_M & 27.0 & 28.0 & 22.8 & 27.1 & 22.8 & 261 / 260 \\
-llama.cpp & Q8\_0 & 22.9 & 23.5 & 20.0 & 22.8 & 20.1 & 295 / 303 \\
-MLX & 4-bit affine, g64 & --- & --- & 34.1 & --- & --- & 268 / 217 \\
+\tabinput{tables/headline.tex}%
 \bottomrule
 \end{tabular}
-\caption{Decode \tps{} on a 22-token chat prompt, 64 tokens, M2~Ultra.
-``Baseline'' is the named engine on the file of that row; the MLX row is
-compared with \ds{} on pure Q4\_K. ``Before'' is the initial \ds{}
-implementation (all switches off). Sampled runs use temperature 1 and
-top-$p$ 0.95. Prefill is on the 1,439-token prompt. llama.cpp's sampled and
-greedy rates coincide because its default sampler applies top-$k$\,=\,40
-before top-$p$, which leaves nothing expensive to do; \ds{} follows the model
-card (no top-$k$) and scans the full distribution.}
+\caption{Milliseconds per decode forward, 20-token ChatML prompt with an empty
+thinking block, 64 generated tokens, mean of five runs (standard deviations
+$\le 0.2$~ms). ``loop'' is the generation loop per forward; \ds{}'s loop is
+greedy, llama.cpp's ``default'' is its metadata-driven chain (top-$k$ 20,
+min-$p$ 0.05) and ``matched'' is \ds{}'s setting (top-$p$ 0.95, no top-$k$).
+Prefill is \tps{} on the 1,439-token prompt. Rates: \ds{} 32.6~\tps{} and
+llama.cpp 23.7~\tps{} forward-only on pure Q4\_K.}
 \label{tab:tps}
 \end{table}
 
-With sampling, \ds{} loses 0.3~\tps{} on Q4\_K (the 0.5~ms sampler of
-\S\ref{sec:cpu}; 2.2~ms before it) and 0.9 on the mixed-recipe file. In the
-interactive REPL with thinking enabled over 256 generated tokens it reaches
-32.2~\tps{}.
+The pre-optimization build takes 35.0~ms per forward (generation-loop
+definition) on pure Q4\_K against 30.8 with everything on
+(Table~\ref{tab:ablation}), so the optimizations of \S\ref{sec:opt} shorten
+the step by 4.2~ms (12\%); the remaining difference to llama.cpp's 42.4
+comes from the engine's existing design, chiefly its shorter per-token
+dispatch list and CPU encode path.
 
 \subsection{Ablation}
-\begin{table}[t]
-\centering
-\begin{tabular}{lrr}
-\toprule
-Configuration & decode \tps{} & $\Delta$ \\
-\midrule
-all optimizations on & 33.1 & \\
-no fused gate/up SwiGLU & 31.1 & $-2.0$ \\
-no multi-weight projections & 31.7 & $-1.3$ \\
-no vectorized single-weight matvec & 32.0 & $-1.1$ \\
-no K-split (FFN down) & 32.0 & $-1.1$ \\
-fixed 32 split-KV workgroups & 32.8 & $-0.3$ \\
-no fused residual+norm & 32.9 & $-0.2$ \\
-multi-weight kernel at 2 rows/simdgroup & 33.2 & $+0.1$ \\
-all off & 29.2 & $-3.9$ \\
-\bottomrule
-\end{tabular}
-\caption{Single-switch ablation, pure Q4\_K, greedy, 22-token prompt, 64
-tokens, mean of two runs; run-to-run spread is about $\pm0.1$~\tps{}.}
-\label{tab:ablation}
-\end{table}
-
 \begin{figure}[t]
 \centering
-\includegraphics[width=0.8\linewidth]{figs/ablation.pdf}
-\caption{Decode throughput with one optimization removed at a time.}
+\includegraphics[width=0.85\linewidth]{figs/ablation.pdf}
+\caption{Leave-one-out effect of each switch on the decode step, in
+milliseconds per forward added relative to the all-on build; three runs each,
+error bars are the combined standard deviation. Table~\ref{tab:ablation} in
+the appendix has the values.}
 \label{fig:ablation}
 \end{figure}
 
@@ -530,69 +534,50 @@ The fused gate/up kernel is the largest single item, followed by the
 multi-weight projections; the vectorized single-weight matvec and the K-split
 overlap because both replace the ggml-style kernel on the FFN down projection.
 The residual+norm fusion and the context-scaled attention are small at a
-40-token context and the sum of the switches (6.0~\tps{}) exceeds the
-end-to-end difference (3.9) because several remove the same dispatch overhead.
+20-token context.
 
-\subsection{Context length and MLX}
-Figure~\ref{fig:context} and Table~\ref{tab:context} sweep the prompt from
-1.4k to 33k tokens. Decode falls from 32.3 to 26.8~\tps{} for \ds{} and from
-23.6 to 20.3 for llama.cpp. The DeltaNet layers cost the same at every length
-(Table~\ref{tab:stages}); the decline is the sixteen attention layers reading
-a K/V cache that grows by 64~KiB per position summed over those layers, plus
-the split-KV reduce (0.97 to 3.38~ms per token from 40 to 8.6k tokens).
-Prefill throughput is the same in \ds{} and llama.cpp within 3\% at every
-length: prefill is a matrix--matrix workload on comparable dequantize-and-multiply
-kernels, and the model-specific graph does not pay there.
+\subsection{Context length and the MLX baseline}
+Figure~\ref{fig:context} sweeps the prompt from 1.4k to 33k tokens (values in
+Table~\ref{tab:context}, appendix; three runs each). \ds{}'s step grows from
+31.4 to 38.1~ms and llama.cpp's from 42.5 to 49.4. The DeltaNet layers cost
+the same at every length (Table~\ref{tab:stages}); the growth is the sixteen
+attention layers reading a K/V cache of 64~KiB per position summed over those
+layers, plus the split-KV reduce (0.96 to 3.36~ms per step from 20 to 8,590
+tokens). Prefill throughput is the same in \ds{} and llama.cpp within 4\% at
+every length: prefill is a matrix--matrix workload on comparable
+dequantize-and-multiply kernels.
 
-MLX is the informative comparison. Its 4-bit affine format (a 16-bit scale and
-bias per group of 64, 4.5 bits per weight, the same as Q4\_K) decodes at
-33.5~\tps{} at 1.4k context and stays within 2.3~\tps{} of \ds{} at every
-length, from a general framework whose model code is a few hundred lines of
-Python over its primitives; its prefill is 13--19\% slower. We read the decode
-parity as a statement about the format, not the graph: affine dequantization
-is a multiply-add per weight, and \S\ref{sec:anatomy} showed that the Q4\_K
-matvecs are held below the Q8\_0 streaming rate by dequantization work.
-\S\ref{sec:q40} tests this directly.
-
-\begin{table}[t]
-\centering
-\begin{tabular}{rrrrrrr}
-\toprule
- & \multicolumn{3}{c}{decode} & \multicolumn{3}{c}{prefill} \\
-Prompt tokens & \ds{} & MLX & llama.cpp & \ds{} & MLX & llama.cpp \\
-\midrule
-1450 & 32.3 & 33.5 & 23.6 & 268 & 217 & 266 \\
-4306 & 29.9 & 32.2 & 22.6 & 272 & 224 & 266 \\
-8590 & 31.3 & 31.0 & 22.8 & 268 & 224 & 261 \\
-17158 & 29.5 & 29.9 & 21.9 & 258 & 219 & 250 \\
-32866 & 26.8 & 27.5 & 20.3 & 239 & 208 & 232 \\
-\bottomrule
-\end{tabular}
-\caption{Throughput (\tps{}) versus prompt length, greedy, 64 decoded tokens,
-single runs. \ds{} and llama.cpp on pure Q4\_K, MLX on its 4-bit affine
-conversion. The 4k/8k inversion for \ds{} is within the $\pm1$~\tps{}
-single-run spread at these lengths.}
-\label{tab:context}
-\end{table}
+MLX is a practical baseline rather than a controlled one. Its community
+conversion stores the layers in 4-bit affine format (a 16-bit scale and bias
+per group of 64; 4.5 bits per weight, the same as Q4\_K) but also the output
+head, at 715~MB against our Q8\_0 head's 1.35~GB, about 1~ms per step at
+these rates; mlx-lm reports only the generation loop; and the model code is
+Python over the framework's primitives. On the same 20-token prompt its loop
+takes 29.4~ms per forward, comparable to \ds{}'s 30.7, and it tracks \ds{}
+across context lengths (30.0 to 36.5~ms) with prefill 13--18\% slower. The comparison shows
+that a general framework on a cheaper format reaches a similar step time; it
+does not isolate the format, which is what \S\ref{sec:q40} does.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\linewidth]{figs/context.pdf}
-\caption{Decode and prefill throughput versus prompt length.}
+\caption{Decode step and prefill throughput versus prompt length, three runs
+each. \ds{} and llama.cpp on pure Q4\_K; MLX on its 4-bit affine conversion
+(generation loop, 4-bit head).}
 \label{fig:context}
 \end{figure}
 
 \subsection{The format lever: Q4\_0 against Q4\_K}
 \label{sec:q40}
-To separate the quantization format from everything else we built a pure
-Q4\_0 file from the same Q8\_0 source with the same importance matrix and the
-same Q8\_0 output head as the pure Q4\_K file: identical bit budget (16.0~GB
-on disk), different block layout. Q4\_0 stores one 16-bit scale per 32
-weights and dequantizes with one multiply-add per weight; Q4\_K packs 6-bit
-sub-block scales and minimums into a 256-weight super-block that must be
-unpacked. We ported the ggml-style Q4\_0 matvec into \ds{} and then the fused
-gate/up and multi-weight kernels; Table~\ref{tab:q40} gives the result at
-each kernel level in both engines.
+To separate the quantization format from everything else we built two files
+from the same Q8\_0 source with the same importance matrix and the same
+Q8\_0 output head: pure Q4\_K and pure Q4\_0, the same bit budget (16.0~GB on
+disk) with different block layouts and therefore different reconstructed
+values. Q4\_0 stores one 16-bit scale per 32 weights and dequantizes with one
+multiply-add per weight; Q4\_K packs 6-bit sub-block scales and minimums into
+a 256-weight super-block that must be unpacked. We ported the ggml-style Q4\_0
+matvec into \ds{} and then the fused gate/up and multi-weight kernels;
+Table~\ref{tab:q40} gives the step time at each kernel level in both engines.
 
 \begin{table}[t]
 \centering
@@ -600,45 +585,48 @@ each kernel level in both engines.
 \toprule
 Engine & Kernels & Q4\_K & Q4\_0 \\
 \midrule
-llama.cpp & stock & 23.8 & 28.4 \\
-\ds{} & per-format ggml-style matvecs, generic fusions & 29.5 & 31.7 \\
-\ds{} & + fused gate/up and multi-weight kernels & 33.1 & 33.6 \\
+llama.cpp & stock (forward-only) & 42.3 & 35.4 \\
+\ds{} & per-format ggml-style matvecs, generic fusions & 34.6 & 31.8 \\
+\ds{} & + fused gate/up and multi-weight kernels & 30.8 & 30.0 \\
 \midrule
-wikitext-2 PPL & & $5.80 \pm 0.07$ & $6.03 \pm 0.07$ \\
+wikitext-2 PPL & & 5.80 & 6.03 \\
 \bottomrule
 \end{tabular}
-\caption{Decode \tps{} for the same weights in Q4\_K and Q4\_0 (both pure,
-same imatrix, Q8\_0 head), greedy, 22-token prompt. ``Generic fusions'' are
-the residual+norm fusion, the single prologue and the context-scaled
-attention, which do not depend on the format. Q4\_0 logits agree with
-llama.cpp to a mean $|\Delta|$ of 0.0009 at decode step 4.}
+\caption{Milliseconds per decode forward for the same source checkpoint in
+Q4\_K and Q4\_0 (both pure, same imatrix, Q8\_0 head), greedy, 20-token
+prompt; \ds{} rows use the generation-loop definition (forward-only is
+0.1~ms less), mean of three to five runs. ``Generic fusions'' are the residual+norm fusion, the single prologue
+and the context-scaled attention, which do not depend on the format. Q4\_0
+logits agree with llama.cpp to a mean $|\Delta|$ of 0.0009 at step 4, and its
+64-token greedy output is identical.}
 \label{tab:q40}
 \end{table}
 
-With simple kernels the format alone is worth 19\% in llama.cpp and 7\% in
-\ds{}: the Q4\_0 gate/up pair streams at 171~$\mu$s per layer against 196
-for Q4\_K. With the fused kernels the two formats land at 33.6 and
-33.1~\tps{}. The stage profile explains why the gains do not compose: the
-fused gate/up kernel takes 166~$\mu$s in Q4\_0 and 164 in Q4\_K, both about
-610~GB/s, so once the largest projection is fused the cheaper dequantization
-has nothing left to buy there. Q4\_0 still gains on the narrower projections
-(84 against 94~$\mu$s for the DeltaNet projections, 75 against 82 for
-attention) and loses on the FFN down projection (103 against 95), which has a
-K-split kernel only for Q4\_K. The format lever therefore matters in
-proportion to how far the kernels are from the streaming ceiling, and MLX's
-34.1~\tps{} on the affine format sits at that same ceiling.
+With simple kernels the format alone shortens the step by 16\% in llama.cpp
+and 8\% in \ds{}: the Q4\_0 gate/up pair takes 171~$\mu$s per layer against
+196 for Q4\_K. With the fused kernels the two formats land at 30.0 and
+30.8~ms, 2.5\% apart. The stage profile is consistent with a simple
+explanation: the fused gate/up kernel takes 166~$\mu$s in Q4\_0 and 163 in
+Q4\_K, both about
+610~GB/s effective, so on the largest projection the cheaper dequantization
+has nothing left to buy once the kernel is fused; Q4\_0 still gains on the
+narrower projections (84 against 94~$\mu$s for the DeltaNet projections, 75
+against 82 for attention) and loses on the FFN down projection (103 against
+95), which has a K-split kernel only for Q4\_K. The format lever matters in
+proportion to how far the kernels are from the streaming bound. It costs
+about 4\% in perplexity, the same trade the MLX conversion makes.
 
 \subsection{A second family: mixture of experts}
 \ds{} was written for DeepSeek V4 Flash, a mixture-of-experts model, and its
 decode there is shaped by a different lever: only the routed experts of a
-token are read, so bytes per token depend on routing, and the engine gathers
+token are read, so bytes per step depend on routing, and the engine gathers
 expert weights from a combined buffer and fuses the router with the
 selection. On the 86~GB mixed-recipe file (IQ2\_XXS routed experts, Q8\_0
-attention projections, shared experts and head), \ds{} decodes at
-30.3~\tps{} against 25.2 for llama.cpp on the same file (greedy, short prompt,
-64 tokens). Table~\ref{tab:moe} is the same profiler on this model. The routed
+attention projections, shared experts and head), \ds{} takes 33.9~ms per
+decode forward (loop definition) against 39.6 forward-only for llama.cpp on
+the same file (greedy, short prompt). Table~\ref{tab:moe} is the same profiler on this model. The routed
 experts, the query path and the attention output projection account for two
-thirds of the token, and no single projection dominates the way the FFN does
+thirds of the step, and no single projection dominates the way the FFN does
 in the dense model; the decomposition applies per family with a different
 dominant term, and the specific kernels do not transfer.
 
@@ -647,23 +635,13 @@ dominant term, and the specific kernels do not transfer.
 \small
 \begin{tabular}{lrr}
 \toprule
-Profiler stage (43 layers) & $\mu$s/layer & ms/token \\
+Profiler stage (43 layers) & $\mu$s/layer & ms/step \\
 \midrule
-\texttt{routed\_moe} & 201 & 8.65 \\
-\texttt{q\_path} & 164 & 7.06 \\
-\texttt{attn\_inv\_rope} & 134 & 5.75 \\
-\texttt{attn\_output} & 117 & 5.05 \\
-\texttt{router} & 51 & 2.18 \\
-\texttt{kv\_path} & 32 & 1.36 \\
-\texttt{attn\_hc\_pre}, \texttt{ffn\_hc\_pre} (hyper-connection mixes) & 26 each & 2.27 \\
-\texttt{shared\_down} & 23 & 1.00 \\
-compressor and indexer updates (amortized) & & 0.51 \\
-\midrule
-total & & 33.8 \\
+\tabinput{tables/moe.tex}%
 \bottomrule
 \end{tabular}
-\caption{Per-stage GPU time for DeepSeek V4 Flash decode on \ds{}, 40-token
-context, using the engine's stage labels. A stage whose kernels are encoded in
+\caption{Per-stage GPU span for DeepSeek V4 Flash decode on \ds{}, short
+prompt, decode positions 18--27, using the engine's stage labels. A stage whose kernels are encoded in
 a neighbour's command buffer is attributed to that neighbour, which is why
 some labels report zero and are omitted.}
 \label{tab:moe}
@@ -671,171 +649,231 @@ some labels report zero and are omitted.}
 
 \section{What did not work}
 \label{sec:negative}
-\paragraph{K-split on wide matrices.} Splitting the reduction across the
-simdgroups of a threadgroup multiplies the thread count for a fixed number of
-output rows. It helped only the long-row FFN down projection and was neutral
-or slightly worse on the 10240- and 12288-output projections; occupancy was
-not their limiter, the activation re-read per row was, and rows per
-simdgroup was the parameter that moved.
-\paragraph{Output gate fused into the attention reduce.} A copy of the
-split-KV reduce that multiplies by $\sigma(\text{gate})$ before its single
+\paragraph{K-split on wide matrices (measured).} Splitting the reduction
+across the simdgroups of a threadgroup multiplies the thread count for a
+fixed number of output rows. It helped only the long-row FFN down projection
+and was neutral or slightly worse on the 10240- and 12288-output projections.
+This is consistent with activation re-reads per row, not occupancy, being the
+limiter on those shapes, since rows per simdgroup was the parameter that
+moved them; a change of rows per simdgroup alters several things at once,
+and we did not isolate the mechanism further.
+\paragraph{Output gate fused into the attention reduce (measured).} A copy of
+the split-KV reduce that multiplies by $\sigma(\text{gate})$ before its single
 store was consistently 20~$\mu$s per layer slower than the shared reduce
 followed by a trivial elementwise gate kernel, even with the gate arithmetic
 removed. The copy specializes its loops on function constants where the shared
 kernel takes them as runtime arguments; we did not confirm that this is the
 cause, and dropped the fusion.
-\paragraph{Convolution folded into the recurrence.} Each of the 1,536
-recurrence threadgroups would recompute the causal convolution for its head's
-256 $q$/$k$ channels, a 32-fold redundant read of the convolution state. The
-estimated cache traffic exceeded the one dispatch it would save.
+\paragraph{Convolution folded into the recurrence (rejected by estimate, not
+measured).} In the proposed design each of the 1,536 recurrence
+threadgroups would recompute the causal convolution for the 256 $q$/$k$
+channels of its head; with 16 distinct $q$/$k$ heads shared by 48 value
+heads, each unique channel would be recomputed 96 times, and the convolution
+state re-read as often. We judged the redundant work larger than the one
+dispatch it would save and did not implement it.
 
 \section{Discussion}
 \label{sec:discussion}
-\paragraph{Model-specific against generic.} \ds{} implements each supported
-architecture as a hand-written graph. The cost is that each new family is a
-port; the benefit is that every fusion above is a local change with a
-measured effect and the per-token dispatch list is known and short. A generic
-graph runner can obtain the same fusions from a pass over its graph, and
-llama.cpp and MLX both fuse some operators, but the two decode-specific
-fusions that mattered most here, batching a layer's side projections into one
-launch and scaling the split-KV work to the context, are decisions about the
-model and the session rather than about the graph. The MLX result shows that a
-cheaper format buys the same as our kernel work at this scale; both together
-would be the next step, and the engine now has the Q4\_0 kernels for it.
-\paragraph{What is left.} The remaining 20\% to the ceiling is split between
-the latency-bound recurrence, the attention path, and per-dispatch ramp;
-\S\ref{sec:q40} shows that dequantization is no longer one of the terms once
-the large matvecs are fused. Beyond that the model ships a multi-token
-prediction head, and speculative decoding with it would verify two tokens per
-weight pass; we have not implemented it.
+\paragraph{What the levers are worth here.} Of the 11.6~ms between
+llama.cpp's step and \ds{}'s, 4.2~ms are the optimizations of this paper and
+the rest is the engine's existing design; the controlled experiments put the
+format lever at 0.8~ms once kernels are fused and at 2.8--6.9~ms when they
+are not. GPU timestamps, CPU critical-path effects and context-dependent
+attention partitioning are not unique to unified memory; what is specific to
+this setting is that at 27B scale on one GPU, per-dispatch cost and CPU gaps
+are each a few percent of the step and add up, and that a slow sampler is
+invisible to every GPU-side tool.
+\paragraph{Hand-written schedules against frameworks.} \ds{} implements each
+family as a hand-written Metal schedule; the cost is that each new family is a
+port, the benefit is that fusions which depend on the model or the session
+(batching a layer's side projections, scaling split-KV work to the context)
+are local changes with measured effects. llama.cpp and MLX both fuse some
+operators; we have not audited which, and the MLX result shows that a cheaper
+format on a general framework reaches a similar step time.
+\paragraph{What is left.} The remaining 20\% to the estimated bound is split
+between the latency-bound recurrence, the attention path and per-dispatch
+ramp; \S\ref{sec:q40} indicates that dequantization is a small term once the
+large matvecs are fused. The model ships a multi-token prediction block, so
+several candidate positions could be verified per weight pass; the benefit
+depends on acceptance rates, drafting cost and verifying the recurrent state,
+and we have not measured it.
 
 \section{Related work}
 \paragraph{Local inference runtimes.} llama.cpp and ggml~\cite{llamacpp,ggml}
-are the reference for consumer-hardware inference; their Q4\_K and Q4\_0
-matvecs are the starting points of the kernels we compare against, and their
-split-KV decode attention is the one we adapt. MLX~\cite{mlx} is Apple's array
-framework; mlx-lm~\cite{mlxlm} implements the Gated DeltaNet families on it.
-\paragraph{Roofline and phase analyses.} Memory-bound decode and the
-prefill/decode split are the basis of FlashAttention and
-Flash-Decoding~\cite{dao2022flashattention,dao2023flashdecoding} and of
-disaggregated serving~\cite{patel2024splitwise,zhong2024distserve}. Those
-analyses target discrete GPUs; the unified-memory setting puts the CPU on the
-inter-token critical path and makes per-dispatch cost visible at 27B scale.
+are the reference for consumer-hardware inference; \ds{}'s Q4\_K and Q4\_0
+matvecs and its split-KV decode attention are ports and adaptations of theirs,
+and the fused kernels of \S\ref{sec:opt} are new. MLX~\cite{mlx} is Apple's
+array framework; mlx-lm~\cite{mlxlm} implements the Gated DeltaNet families.
+\paragraph{Roofline and phase analyses.} FlashAttention~\cite{dao2022flashattention}
+made attention IO-aware for training and prefill; Flash-Decoding~\cite{dao2023flashdecoding}
+partitions decode attention along the key sequence, which is the design the
+split-KV kernel here follows; disaggregated serving~\cite{patel2024splitwise,zhong2024distserve}
+separates the prefill and decode phases at the cluster level. These target
+discrete GPUs and batched serving; we measure single-stream decode where the
+CPU shares the memory system.
 \paragraph{Hybrid linear-attention models.} Gated
 DeltaNet~\cite{yang2025gateddeltanet} and the Qwen3-Next and Qwen3.5
 families~\cite{qwen3next,qwen35} interleave linear-attention layers with a
 minority of softmax-attention layers; the reference CUDA kernels~\cite{yang2024fla}
-use chunked and recurrent forms that do not transfer to Metal.
+cannot be used on Metal, and the decode recurrence here is a direct
+implementation of the delta rule.
 \paragraph{Quantization formats.} Weight-only quantization
 methods~\cite{frantar2023gptq,lin2024awq}, the k-quant block
 formats~\cite{kquants}, importance-matrix calibration~\cite{imatrix} and
 mixed-recipe files~\cite{unslothdynamic} trade bytes for dequantization work;
-\S\ref{sec:q40} measures that trade on Apple GPUs.
+\S\ref{sec:q40} measures that trade on an Apple GPU.
 \paragraph{Speculative and multi-token decoding.} Verifying several tokens per
 weight pass~\cite{leviathan2023fast,chen2023accelerating,cai2024medusa,li2024eagle}
 is the standard route past the streaming bound; the model used here ships a
-multi-token prediction head~\cite{gloeckle2024mtp,deepseekv3}.
+multi-token prediction block~\cite{gloeckle2024mtp,deepseekv3}.
 
 \section{Limitations}
-All results are from one machine, an M2~Ultra with a 60-core GPU. The
-achieved bandwidth fractions and the balance between levers will differ on
-other generations; in particular the M5 family adds GPU matrix units that
-change the prefill regime, and a device sweep is the obvious extension. The
-decomposition is for one dense hybrid family; the MoE result is a throughput
-and a profile, not an ablation. The per-stage profiler perturbs what it
-measures by isolating stages, so we use it for rankings and deltas only.
-The sampler finding depends on compiler flags and may not reproduce under
-\texttt{-fno-finite-math-only}. The downstream check has ten items.
+All results are from one machine, an M2~Ultra with a 60-core GPU; achieved
+rates and the balance between levers will differ on other generations (the
+M5 family adds GPU matrix units that change the prefill regime), and a device
+sweep is the obvious extension. The decomposition is for one dense hybrid
+family; the MoE result is a step time and a profile, not an ablation. The
+per-stage profiler perturbs what it measures by isolating stages, so we use
+it for rankings and deltas. Effective bandwidths are bytes over kernel time,
+not counter measurements; the mechanisms proposed for the kernel results are
+consistent with the data but were not isolated with microbenchmarks. The
+correctness checks are spot checks at eight points; perplexity is on forty
+chunks of one corpus; the sampler finding depends on the compiler and flags.
 
 \section{Conclusion}
-A decode token on Apple silicon is not simply bandwidth bound at the 27B
+A decode step on Apple silicon is not simply bandwidth bound at the 27B
 scale: matvec kernel shape, dispatch count and CPU work between tokens each
-cost milliseconds, and each needs its own measurement. Taking GPU timestamps
-per stage and timing the CPU gap turned each optimization into a targeted
-change with a known payoff, the switches make the account auditable, and the
-controlled format experiment shows where one lever stops and another starts.
+cost milliseconds, and each needs its own measurement. GPU timestamps per
+stage and a CPU inter-token split turned each optimization into a targeted
+change with a measured effect, the switches make the account auditable, and
+the controlled format experiment shows where one lever stops and another
+starts.
 
 \bibliographystyle{plain}
 \bibliography{refs}
 
 \appendix
+\section{Additional results}
+\label{sec:appendix-results}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+Configuration & ms/forward & $\Delta$ vs all on \\
+\midrule
+\tabinput{tables/ablation.tex}%
+\bottomrule
+\end{tabular}
+\caption{Leave-one-out ablation, pure Q4\_K, greedy, 20-token prompt, 64
+tokens, generation loop per forward, mean of three runs.}
+\label{tab:ablation}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{rrrrrrr}
+\toprule
+ & \multicolumn{3}{c}{ms per decode forward} & \multicolumn{3}{c}{prefill \tps{}} \\
+Prompt tokens & \ds{} loop & MLX loop & llama.cpp fwd & \ds{} & MLX & llama.cpp \\
+\midrule
+\tabinput{tables/context.tex}%
+\bottomrule
+\end{tabular}
+\caption{Context-length sweep, greedy, 64 decoded tokens, mean $\pm$ sd of
+three runs. \ds{} and llama.cpp on pure Q4\_K, MLX on its 4-bit affine
+conversion; token counts are llama.cpp's for the shared prompt files (MLX's
+tokenizer counts one fewer).}
+\label{tab:context}
+\end{table}
+
+\subsection{Downstream check}
+\label{sec:downstream}
+As a coarse check on reasoning tasks we ran \ds{}'s built-in evaluation
+harness on its first ten questions (drawn from GPQA Diamond, SuperGPQA and
+AIME 2025) with thinking enabled, greedy decoding and a 2,500-token reply
+budget. The harness forces the thinking block closed near the budget and
+extracts an answer from what follows, so a cut-off answer can still be
+correct. Pure Q4\_K scored 8/10 (3 cut off), pure Q4\_0 7/10 (3), Q8\_0
+7/10 (4): within one question of each other, which is the resolution of ten
+items, and not evidence of a ranking.
+
 \section{Reproduction}
 \label{sec:repro}
 The code is our fork of the \ds{} repository~\cite{ds4} at \branchurl{}.
-Three branches build on each other: \texttt{general-decode-fixes} (sampler and
-diagnostics), \texttt{qwen38-support} (the model and its decode paths) and
-\texttt{paper-artifact} (this document and the scripts under
-\texttt{paper/scripts/}). Everything below was run on macOS 26.1 with
-Xcode's command-line tools; a llama.cpp checkout is needed for the baselines,
-the reference logits and the quantization.
+Three branches build on each other: \texttt{general-decode-fixes} (sampler
+and diagnostics), \texttt{qwen38-support} (the model and its decode paths)
+and \texttt{paper-artifact}, which holds this document, the scripts
+(\texttt{paper/scripts/}), the raw logs (\texttt{paper/logs/}) and the result
+set (\texttt{results.json}) from which the tables and figures are generated. Everything below was run on macOS 26.1 with Xcode's command-line
+tools; a llama.cpp checkout is needed for the baselines, the reference logits
+and the quantization. Every command is run from the repository root unless
+stated.
 
 \subsection*{1. Build}
 \begin{lstlisting}
 git clone https://github.com/parasol-aser/ds4 && cd ds4 && git checkout paper-artifact
 make                                   # ds4, ds4-server, ds4-agent, ds4-eval
 git clone https://github.com/ggml-org/llama.cpp ~/github/llama.cpp
-cd ~/github/llama.cpp && git checkout 6d9c82ea2
-cmake -B build && cmake --build build -j
-pip3 install -U mlx-lm                 # 0.31.3 or later for the qwen3_5 architecture
+(cd ~/github/llama.cpp && git checkout 6d9c82ea2bb34e277c0664b8dd3434bfb4dcfb27 \
+   && cmake -B build && cmake --build build -j)
+pip3 install mlx==0.32.2 mlx-lm==0.31.3 huggingface_hub matplotlib numpy
 \end{lstlisting}
 
 \subsection*{2. Models}
 \begin{lstlisting}
-./download_model.sh qwen38-q8          # Qwen3.8-27B-Q8_0.gguf
-./download_model.sh qwen38-q4km        # Qwen3.8-27B-UD-Q4_K_M.gguf
-./download_model.sh ds4f-q2            # DeepSeek V4 Flash mixed-recipe file
-# importance matrix from the same Unsloth release, then the two pure files:
-cd gguf
-curl -LO https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/imatrix_unsloth.gguf
-L=~/github/llama.cpp/build/bin
-$L/llama-quantize --allow-requantize --pure --imatrix imatrix_unsloth.gguf \
-  --output-tensor-type q8_0 --token-embedding-type q4_k \
-  Qwen3.8-27B-Q8_0.gguf Qwen3.8-27B-Q4_K.gguf Q4_K_S 8
-$L/llama-quantize --allow-requantize --pure --imatrix imatrix_unsloth.gguf \
-  --output-tensor-type q8_0 --token-embedding-type q4_0 \
-  Qwen3.8-27B-Q8_0.gguf Qwen3.8-27B-Q4_0.gguf Q4_0 8
+./download_model.sh qwen38-q8          # Qwen3.8-27B-Q8_0.gguf      (unsloth/Qwen3.8-27B-GGUF @ 4ca7207)
+./download_model.sh qwen38-q4km        # Qwen3.8-27B-UD-Q4_K_M.gguf (same release)
+./download_model.sh ds4f-q2            # DeepSeek V4 Flash mixed-recipe file (-0731 build)
+paper/scripts/run_q40.sh               # fetches imatrix_unsloth.gguf, builds the pure Q4_K and Q4_0 files, prints SHA-256
 \end{lstlisting}
-The DeepSeek file we measured is the earlier build of the \texttt{ds4f-q2}
-recipe (same name without the \texttt{-0731} suffix).
+SHA-256 of the files we measured (\texttt{paper/logs/sha256.txt}):
+\begin{center}\footnotesize\begin{tabular}{ll}\toprule File & SHA-256 (first 16 and last 8 hex digits) \\ \midrule
+\tabinput{tables/sha256.tex}%
+\bottomrule\end{tabular}\end{center}
+The DeepSeek file we profiled is an earlier
+build of the \texttt{ds4f-q2} recipe (same name without the \texttt{-0731}
+suffix) that is no longer distributed; its step time in \S\ref{sec:eval}
+should be re-measured on the current file.
 
-\subsection*{3. Reference logits}
+\subsection*{3. Experiments}
 \begin{lstlisting}
 cd paper/scripts && mkdir -p out
-c++ -std=c++17 -O2 -I ~/github/llama.cpp/include -I ~/github/llama.cpp/ggml/include \
-  logits_dump.cpp -L ~/github/llama.cpp/build/bin -lllama -lggml -lggml-base \
-  -Wl,-rpath,$HOME/github/llama.cpp/build/bin -o out/logits_dump
-# reference: prefill, greedy, dump the logits of step 4
-out/logits_dump ../../gguf/Qwen3.8-27B-Q4_K.gguf "$PROMPT" 8 5 4 out/ref_s4.bin
-# ds4: same prompt, dump the logits of its 4th forward
-DS4_GLM_LOGIT_DUMP=out/ds4_s4.bin DS4_QWEN_LOGIT_DUMP_STEP=4 \
-  ../../ds4 -m ../../gguf/Qwen3.8-27B-Q4_K.gguf -p "$PROMPT" -n 8 --temp 0 -c 4096
-python3 cmp.py out/ds4_s4.bin out/ref_s4.bin      # mean/max |diff|, argmax
-\end{lstlisting}
-\texttt{\$PROMPT} is the ChatML prompt with an empty thinking block, as in
-\texttt{run\_all.sh}.
-
-\subsection*{4. Experiments}
-\begin{lstlisting}
-cd paper/scripts
 curl -sL -o out/wikitext-2-raw-v1.zip \
   https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
 unzip -qo out/wikitext-2-raw-v1.zip -d out
-python3 make_prompts.py                # out/prompt_{1k,4k,8k,16k,32k}.txt
-./run_all.sh                           # ~30 min: sweeps, ablation, profiles, PPL, MoE
-./run_q40.sh                           # ~15 min: pure Q4_0 experiment
-./run_mlx.sh                           # download (15 GB) + ~20 min
-./run_eval.sh                          # ~40 min: downstream check
-python3 analyze.py                     # tables; python3 figures.py -> ../figs/
+python3 make_prompts.py        # out/prompt_{1k,4k,8k,16k,32k}.txt from prompt_1439.txt
+./run_all.sh                   # ~2 h: headline (5 runs), context (3 runs), ablation (3), profiles, PPL, MoE
+./run_correctness.sh           # ~15 min: reference logits at 8 (prompt, step) points, compiles logits_dump
+./run_eval.sh                  # ~40 min: downstream check
+python3 analyze.py             # out/results.json and the tables
+python3 figures.py             # ../figs/{context,ablation,breakdown}.pdf
 \end{lstlisting}
-The GPU must be otherwise idle: \ds{} refuses to start while another \ds{}
-process holds \texttt{/tmp/ds4.lock}, and timing is not meaningful with a
-second model process on the GPU.
-
-\subsection*{5. Switches and profilers}
+The scripts anchor paths on their own location, stop on the first missing
+prerequisite or failed command, and write every raw log to
+\texttt{out/logs/}. In our runs three measurements hit disk-bound stalls
+after the page cache had been turned over by other model files (one
+llama.cpp 16k-context run at 1.6~s per token, one \ds{} Q8\_0 prefill at
+44~\tps{}, one Q4\_0 run at 0.5~\tps{}); they were rerun with a warm cache
+and the packaged logs hold the reruns. The GPU must be otherwise idle: \ds{} refuses to start
+while another \ds{} process holds \texttt{/tmp/ds4.lock}, and timing is not
+meaningful with a second model process on the GPU. The short prompt is
 \begin{lstlisting}
-DS4_METAL_DECODE_STAGE_PROFILE=1 DS4_METAL_CB_TIMES=1  # per-stage GPU spans
-DS4_TOKEN_TIMING=1                       # CLI: sample / emit / eval per token
-DS4_GLM_LOGIT_DUMP=f DS4_QWEN_LOGIT_DUMP_STEP=k   # logits of the k-th forward
+<|im_start|>user
+Write a short paragraph about the ocean.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+\end{lstlisting}
+(20 tokens); the 1,439-token prompt is \texttt{paper/scripts/prompt\_1439.txt}.
+
+\subsection*{4. Switches and profilers}
+\begin{lstlisting}
+DS4_METAL_DECODE_STAGE_PROFILE=1 DS4_METAL_CB_TIMES=1  # per-stage GPU spans (stage_agg.py aggregates)
+DS4_TOKEN_TIMING=1                       # CLI: sample / emit / forward per token; per-forward ms when greedy
+DS4_GLM_LOGIT_DUMP=f DS4_QWEN_LOGIT_DUMP_STEP=k   # logits of step k (0 = prefill output)
 DS4_QWEN_DISABLE_FUSED_SWIGLU=1   # fused gate/up -> two matvecs + SwiGLU
 DS4_QWEN_DISABLE_MULTI_PROJ=1     # multi-weight proj -> one launch each
 DS4_QWEN_DISABLE_FAST_MV=1        # vectorized single-weight mv -> ggml-style
@@ -844,9 +882,8 @@ DS4_METAL_QWEN_FA_NWG=32          # fixed 32 split-KV workgroups
 DS4_QWEN_DISABLE_FUSED_NORM=1     # residual+norm fusion off
 DS4_METAL_Q4K_MULTI_NR0=2         # multi-weight kernel rows per simdgroup
 \end{lstlisting}
-Stage-profile logs are aggregated with \texttt{stage\_agg.py}. The Metal
-System Trace captures of \S\ref{sec:anatomy} were recorded and exported
-with:
+The Metal System Trace captures of \S\ref{sec:anatomy} were recorded and
+exported with:
 \begin{lstlisting}
 xcrun xctrace record --template 'Metal System Trace' --time-limit 120s \
   --output ds4.trace --launch -- ./ds4 -m gguf/Qwen3.8-27B-UD-Q4_K_M.gguf -p "$PROMPT" -n 32 --temp 0

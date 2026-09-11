@@ -1,0 +1,38 @@
+0.00.027.784 I llama_completion: llama backend init
+0.00.027.788 I llama_completion: load the model and apply lora adapter, if any
+0.00.507.237 W model has unused tensor blk.64.attn_norm.weight (size = 20480 bytes) -- ignoring
+0.00.507.248 W model has unused tensor blk.64.post_attention_norm.weight (size = 20480 bytes) -- ignoring
+0.00.507.255 W model has unused tensor blk.64.attn_q.weight (size = 35389440 bytes) -- ignoring
+0.00.507.257 W model has unused tensor blk.64.attn_k.weight (size = 2949120 bytes) -- ignoring
+0.00.507.260 W model has unused tensor blk.64.attn_v.weight (size = 2949120 bytes) -- ignoring
+0.00.507.268 W model has unused tensor blk.64.attn_output.weight (size = 17694720 bytes) -- ignoring
+0.00.507.270 W model has unused tensor blk.64.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.00.507.272 W model has unused tensor blk.64.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.00.507.274 W model has unused tensor blk.64.ffn_gate.weight (size = 50135040 bytes) -- ignoring
+0.00.507.276 W model has unused tensor blk.64.ffn_down.weight (size = 50135040 bytes) -- ignoring
+0.00.507.278 W model has unused tensor blk.64.ffn_up.weight (size = 50135040 bytes) -- ignoring
+0.00.507.281 W model has unused tensor blk.64.nextn.eh_proj.weight (size = 29491200 bytes) -- ignoring
+0.00.507.284 W model has unused tensor blk.64.nextn.enorm.weight (size = 20480 bytes) -- ignoring
+0.00.507.286 W model has unused tensor blk.64.nextn.hnorm.weight (size = 20480 bytes) -- ignoring
+0.00.507.292 W model has unused tensor blk.64.nextn.shared_head_norm.weight (size = 20480 bytes) -- ignoring
+0.01.182.928 I cmn          init: llama threadpool init, n_threads = 16
+0.01.186.278 I 
+0.01.186.298 I system_info: n_threads = 16 (n_threads_batch = 16) / 24 | MTL : EMBED_LIBRARY = 1 | CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | MATMUL_INT8 = 1 | DOTPROD = 1 | ACCELERATE = 1 | REPACK = 1 | 
+0.01.186.298 I 
+0.01.186.371 I sampler seed: 1259864135
+0.01.186.375 I sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = 64
+	top_k = 0, top_p = 0.950, min_p = 0.000, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 1.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+0.01.186.378 I sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> ?top-k -> ?typical -> top-p -> ?min-p -> ?xtc -> ?temp-ext -> dist 
+0.01.186.379 I generate: n_ctx = 4096, n_batch = 2048, n_predict = 64, n_keep = 0
+0.01.186.379 I 
+0.03.683.086 I common_perf_print:    sampling time =      78.39 ms
+0.03.683.087 I common_perf_print:    samplers time =      75.14 ms /    84 tokens
+0.03.683.087 I common_perf_print:        load time =     186.10 ms
+0.03.683.088 I common_perf_print: prompt eval time =     185.99 ms /    20 tokens (    9.30 ms per token,   107.53 tokens per second)
+0.03.683.089 I common_perf_print:        eval time =    2231.69 ms /    63 runs   (   35.42 ms per token,    28.23 tokens per second)
+0.03.683.089 I common_perf_print:       total time =    2496.81 ms /    83 tokens
+0.03.683.090 I common_perf_print: unaccounted time =       0.73 ms /   0.0 %      (total - sampling - prompt eval - eval) / (total)
+0.03.683.091 I common_perf_print:    graphs reused =         62

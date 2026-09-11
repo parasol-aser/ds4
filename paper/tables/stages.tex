@@ -1,0 +1,13 @@
+both & FFN gate/up & 195.6 & 12.52 & 162.9 & 10.43 & 10.44 \\
+both & FFN down & 112.0 & 7.16 & 95.0 & 6.08 & 6.07 \\
+DeltaNet & projections $qkv$, $z$, $\alpha$, $\beta$ & 115.2 & 5.53 & 94.1 & 4.52 & 4.48 \\
+attention & projections $q|$gate, $k$, $v$ & 94.9 & 1.52 & 82.1 & 1.31 & 1.30 \\
+DeltaNet & output norm + out projection & 45.3 & 2.17 & 48.3 & 2.32 & 2.31 \\
+attention & gate + out projection & 42.8 & 0.68 & 44.9 & 0.72 & 0.72 \\
+DeltaNet & conv + recurrence & 23.8 & 1.14 & 23.8 & 1.14 & 1.14 \\
+attention & split-KV attention (+pad, reduce) & 106.3 & 1.70 & 60.3 & 0.96 & 3.36 \\
+attention & $q$/$k$ prologue, $V$ store & 7.9 & 0.13 & 8.0 & 0.13 & 0.14 \\
+both & residual adds and norms & 29.9 & 1.91 & 23.6 & 1.51 & 1.48 \\
+ & output head (Q8\_0) &  & 2.01 &  & 2.01 & 2.01 \\
+\midrule
+ & sum of stage spans & & 36.47 & & 31.13 & 33.47 \\%
