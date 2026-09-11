@@ -117,7 +117,7 @@ Our contributions, and what we learned from each:
   sampler cost came from \texttt{isfinite} being left as a library call under
   \texttt{-ffast-math}; a first replacement was folded away by the same flags
   and broke NaN handling. llama.cpp's own full-vocabulary top-$p$ sampler
-  costs 1.2~ms per token on the same distribution.
+  costs 1.2~ms per token with the same sampling settings.
 \item \textbf{Negative results with mechanisms} (\S\ref{sec:negative}), a
   profile of a mixture-of-experts model on the same instrument, and the
   code, switches, logs and scripts (Appendix~\ref{sec:repro}).
@@ -192,7 +192,7 @@ Per decode step & & 15.06~GB \\
 \end{tabular}
 \caption{Bytes read per decode step for Qwen3.8-27B in pure Q4\_K
 (0.5625~B/weight) with a Q8\_0 output head (1.0625~B/weight), from the GGUF
-tensor sizes. Norms and biases add 20~KB; the auxiliary MTP block (239~MB) and
+tensor sizes. The output norm adds 20~KB; the auxiliary MTP block (239~MB) and
 the token-embedding table (715~MB, one row read) are excluded.}
 \label{tab:bytes}
 \end{table}
@@ -219,12 +219,19 @@ time.
 
 \begin{figure}[t]
 \centering
-\resizebox{\linewidth}{!}{\input{figs/timeline.tex}}
-\caption{What each reported quantity covers. We report milliseconds per decode
-forward under two definitions: \emph{forward-only} (the GPU forward of one
-token) and \emph{generation loop} (forward plus sampling plus emission,
-divided by the 63 forwards of a 64-token run). Rates in \tps{} are
-$1000/\text{ms}$.}
+\resizebox{\linewidth}{!}{\input{figs/timeline.tex}}\par\vspace{0.5em}
+\caption{What each reported quantity covers. Token 1 is sampled from the
+prefill logits, so a 64-token run performs 63 decode forwards. We report
+milliseconds per decode forward under two definitions: \emph{forward-only},
+the host-elapsed time of one forward call (encoding, submission and
+synchronization included; distinct from the per-stage GPU spans of
+\S\ref{sec:method}), and \emph{generation loop}, the whole loop (forward,
+sampling, emission) divided by the 63 forwards. For \ds{} both come from the
+CLI under \texttt{DS4\_TOKEN\_TIMING}; for llama.cpp the forward is its
+\emph{eval time} per run and the loop is approximated by adding its
+\emph{sampling time}, which omits its emission overhead; mlx-lm reports only
+$n$ output tokens over the time of $n-1$ forwards, converted accordingly.
+Rates in \tps{} are $1000/\text{ms}$.}
 \label{fig:timeline}
 \end{figure}
 
@@ -233,13 +240,10 @@ Engines count differently: a 64-token run performs 63 decode forwards, the
 first token being sampled from the prefill logits, and llama.cpp's
 \emph{eval time} excludes sampling while a generation-loop clock includes it.
 We therefore report milliseconds per decode forward under two explicit
-definitions (Figure~\ref{fig:timeline}). For \ds{} the CLI, under
-\texttt{DS4\_TOKEN\_TIMING}, reports per token the time in sampling, in
-emission and in the forward call; for llama.cpp we use its \emph{eval time}
-per run and add its \emph{sampling time} for the loop; mlx-lm reports only the
-loop. All headline numbers are means over five runs on an otherwise idle GPU
-with the model file in the page cache; standard deviations are given in the
-result set.
+definitions (Figure~\ref{fig:timeline}), averaging over all 63 forwards of a
+run in both engines. Headline numbers are means over five runs (three for
+llama.cpp's default-sampler column) on an otherwise idle GPU with the model
+file in the page cache; standard deviations are in the result set.
 
 \paragraph{Per-stage GPU spans.}
 \ds{} can close and reopen its command buffer at named stage boundaries inside
@@ -427,10 +431,9 @@ greedy outputs are identical on the Q4\_0, UD-Q4\_K\_M and Q8\_0 files and
 diverge at token 46 on Q4\_K, where a near-tie resolves differently (so the
 step-63 point on the 20-token prompt compares different histories and is
 omitted). The values were unchanged, to the printed
-precision, across every optimization added in \S\ref{sec:opt}; prefill
-logits are bit-identical between the initial and final builds because no
-prefill kernel changed. Two prompts and eight steps are spot checks, not a
-proof of equivalence over long generations.
+precision, across every optimization added in \S\ref{sec:opt}; prefill logits are bit-identical between the initial and final builds because no
+prefill kernel changed. Three prompts and eight (prompt, step) points are spot
+checks, not a proof of equivalence over long generations.
 
 \begin{table}[t]
 \centering
@@ -447,12 +450,14 @@ KL is $D(\ds{}\,\|\,\text{llama.cpp})$ of the softmax distributions.}
 \end{table}
 
 \subsection{Quality of the files}
-Because both engines read the same file and agree to this precision, the
-quality of a file is a property of the quantization, not of the engine.
+We measure the quantization quality of the GGUF files with llama.cpp; the
+logit comparisons above separately establish \ds{}'s numerical agreement
+with that implementation on the tested prompts and steps, and do not by
+themselves prove that quality is engine-independent along long generations.
 Table~\ref{tab:ppl} gives wikitext-2 perplexity~\cite{merity2016pointer}, and
-because all files score the same chunks we report paired differences of the
-per-chunk loss with a chunk-level standard error, which is the informative
-statistic. Pure Q4\_K, UD-Q4\_K\_M and Q8\_0 are within 1\% of each other
+because all files score the same chunks we report the paired relative
+perplexity change with a chunk-level standard error, which is the
+informative statistic. Pure Q4\_K, UD-Q4\_K\_M and Q8\_0 are within 1\% of each other
 (the differences are 1--2 chunk-level standard errors, and the ordering is not
 the one bit width would predict); pure Q4\_0 and the MLX conversion are 3--4\%
 worse, at 4 standard errors for Q4\_0. Forty chunks of wikitext-2 are a
@@ -470,9 +475,10 @@ File & bytes/weight & PPL & paired vs pure Q4\_K \\
 \caption{Perplexity on the first 40 chunks of 2048 tokens of wikitext-2 test,
 scoring positions 1025--2047 of each chunk (\texttt{llama-perplexity}; a
 script with the same chunking for the MLX model). The $\pm$ after each PPL is
-llama-perplexity's token-level standard error; the last column is the mean
-paired difference of per-chunk loss, as a percentage, with its chunk-level
-standard error. Bytes per weight are for the layer tensors.}
+llama-perplexity's token-level standard error; the last column is the
+relative perplexity change $\exp(\bar d)-1$ from the mean paired difference
+$\bar d$ of per-chunk loss, with the delta-method standard error
+$\exp(\bar d)\,\mathrm{SE}(\bar d)$ over 40 chunks. Bytes per weight are for the layer tensors.}
 \label{tab:ppl}
 \end{table}
 
@@ -493,31 +499,35 @@ top-$p$) in llama.cpp.
 
 \begin{table}[t]
 \centering
-\small
-\begin{tabular}{lrrrrrr}
+\footnotesize
+\begin{tabular}{lrrrrrrr}
 \toprule
- & \multicolumn{2}{c}{\ds{} (ms/forward)} & \multicolumn{3}{c}{llama.cpp (ms/forward)} & \\
-File & forward & loop & forward & loop, default & loop, matched & prefill \ds{}/llama \\
+ & \multicolumn{3}{c}{\ds{} (ms/forward)} & \multicolumn{3}{c}{llama.cpp (ms/forward)} & prefill \tps{} \\
+File & fwd & loop greedy & loop sampled & fwd & loop default & loop matched & \ds{} / llama \\
 \midrule
 \tabinput{tables/headline.tex}%
 \bottomrule
 \end{tabular}
 \caption{Milliseconds per decode forward, 20-token ChatML prompt with an empty
-thinking block, 64 generated tokens, mean of five runs (standard deviations
-$\le 0.2$~ms). ``loop'' is the generation loop per forward; \ds{}'s loop is
-greedy, llama.cpp's ``default'' is its metadata-driven chain (top-$k$ 20,
-min-$p$ 0.05) and ``matched'' is \ds{}'s setting (top-$p$ 0.95, no top-$k$).
-Prefill is \tps{} on the 1,439-token prompt. Rates: \ds{} 32.6~\tps{} and
-llama.cpp 23.7~\tps{} forward-only on pure Q4\_K.}
+thinking block, 64 generated tokens, mean of five runs (three for llama.cpp's
+default column; standard deviations $\le 0.2$~ms). ``loop'' is the
+generation loop per forward: \ds{} greedy and sampled with its settings
+(temperature 1, top-$p$ 0.95, no top-$k$); llama.cpp's ``default'' is its
+metadata-driven chain (top-$k$ 20, min-$p$ 0.05) and ``matched'' is \ds{}'s
+setting, both as eval plus sampling time. The sampled comparison is therefore
+\ds{} ``loop, sampled'' against llama.cpp ``loop, matched''. Prefill is
+\tps{} on the 1,439-token prompt. Rates: \ds{} 32.6~\tps{} and llama.cpp
+23.7~\tps{} forward-only on pure Q4\_K.}
 \label{tab:tps}
 \end{table}
 
 The pre-optimization build takes 35.0~ms per forward (generation-loop
 definition) on pure Q4\_K against 30.8 with everything on
 (Table~\ref{tab:ablation}), so the optimizations of \S\ref{sec:opt} shorten
-the step by 4.2~ms (12\%); the remaining difference to llama.cpp's 42.4
-comes from the engine's existing design, chiefly its shorter per-token
-dispatch list and CPU encode path.
+the step by 4.2~ms (12\%). The remaining difference to llama.cpp's 42.4 is
+the engine's existing design; the profiles of \S\ref{sec:anatomy} point at
+its shorter per-token dispatch list and CPU encode path, but we have not
+ablated those factors across engines.
 
 \subsection{Ablation}
 \begin{figure}[t]
@@ -553,8 +563,9 @@ per group of 64; 4.5 bits per weight, the same as Q4\_K) but also the output
 head, at 715~MB against our Q8\_0 head's 1.35~GB, about 1~ms per step at
 these rates; mlx-lm reports only the generation loop; and the model code is
 Python over the framework's primitives. On the same 20-token prompt its loop
-takes 29.4~ms per forward, comparable to \ds{}'s 30.7, and it tracks \ds{}
-across context lengths (30.0 to 36.5~ms) with prefill 13--18\% slower. The comparison shows
+takes 29.8~ms per forward, comparable to \ds{}'s 30.7, and it tracks \ds{}
+across context lengths (30.4 to 37.1~ms, within 1~ms of \ds{} at every
+length) with prefill 13--18\% slower. The comparison shows
 that a general framework on a cheaper format reaches a similar step time; it
 does not isolate the format, which is what \S\ref{sec:q40} does.
 
@@ -782,8 +793,10 @@ Prompt tokens & \ds{} loop & MLX loop & llama.cpp fwd & \ds{} & MLX & llama.cpp 
 \end{tabular}
 \caption{Context-length sweep, greedy, 64 decoded tokens, mean $\pm$ sd of
 three runs. \ds{} and llama.cpp on pure Q4\_K, MLX on its 4-bit affine
-conversion; token counts are llama.cpp's for the shared prompt files (MLX's
-tokenizer counts one fewer).}
+conversion; all three engines read the same prompt files (hashes in
+\texttt{paper/logs/prompt\_sha256.txt}) and their tokenizers agree on the
+counts shown. On the 32,866-token prompt mlx-lm stopped at 54 tokens (end of
+sequence); its per-forward rate is unaffected.}
 \label{tab:context}
 \end{table}
 
@@ -800,15 +813,21 @@ items, and not evidence of a ranking.
 
 \section{Reproduction}
 \label{sec:repro}
-The code is our fork of the \ds{} repository~\cite{ds4} at \branchurl{}.
-Three branches build on each other: \texttt{general-decode-fixes} (sampler
-and diagnostics), \texttt{qwen38-support} (the model and its decode paths)
-and \texttt{paper-artifact}, which holds this document, the scripts
-(\texttt{paper/scripts/}), the raw logs (\texttt{paper/logs/}) and the result
-set (\texttt{results.json}) from which the tables and figures are generated. Everything below was run on macOS 26.1 with Xcode's command-line
-tools; a llama.cpp checkout is needed for the baselines, the reference logits
-and the quantization. Every command is run from the repository root unless
-stated.
+The code is our fork of the \ds{} repository~\cite{ds4}:
+\begin{center}\branchurl{}\end{center}
+Three branches build on each other. The sampler and the diagnostics are on
+\texttt{general-decode-fixes}; the model and its decode paths are on
+\texttt{qwen38-support}; this document and the scripts in
+\texttt{paper/scripts/} are on \texttt{paper-artifact}. The runs reported here are packaged under
+\texttt{paper/logs/}: the raw logs, the result set \texttt{results.json},
+the model-file hashes in \texttt{sha256.txt}, and the hashes of the prompts
+and of the wikitext-2 archive and test split in \texttt{prompt\_sha256.txt}.
+The downstream questions are built into \texttt{ds4-eval} at the pinned
+commit. The scripts write to \texttt{paper/scripts/out/}, and
+\texttt{tables.py} generates the table bodies from the result set.
+Everything below was run on macOS 26.1 with Xcode's command-line tools; a
+llama.cpp checkout is needed for the baselines, the reference logits and the
+quantization. Every command is run from the repository root unless stated.
 
 \subsection*{1. Build}
 \begin{lstlisting}
@@ -827,7 +846,8 @@ pip3 install mlx==0.32.2 mlx-lm==0.31.3 huggingface_hub matplotlib numpy
 ./download_model.sh ds4f-q2            # DeepSeek V4 Flash mixed-recipe file (-0731 build)
 paper/scripts/run_q40.sh               # fetches imatrix_unsloth.gguf, builds the pure Q4_K and Q4_0 files, prints SHA-256
 \end{lstlisting}
-SHA-256 of the files we measured (\texttt{paper/logs/sha256.txt}):
+SHA-256 of the files we measured (\texttt{paper/logs/sha256.txt};
+\texttt{run\_q40.sh} verifies them with \texttt{VERIFY\_HASHES=1}):
 \begin{center}\footnotesize\begin{tabular}{ll}\toprule File & SHA-256 (first 16 and last 8 hex digits) \\ \midrule
 \tabinput{tables/sha256.tex}%
 \bottomrule\end{tabular}\end{center}
@@ -841,13 +861,15 @@ should be re-measured on the current file.
 cd paper/scripts && mkdir -p out
 curl -sL -o out/wikitext-2-raw-v1.zip \
   https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
-unzip -qo out/wikitext-2-raw-v1.zip -d out
+unzip -qo out/wikitext-2-raw-v1.zip -d out   # zip sha256 ef7edb56...435a11; wiki.test.raw 173c87a5...7dd08
 python3 make_prompts.py        # out/prompt_{1k,4k,8k,16k,32k}.txt from prompt_1439.txt
 ./run_all.sh                   # ~2 h: headline (5 runs), context (3 runs), ablation (3), profiles, PPL, MoE
-./run_correctness.sh           # ~15 min: reference logits at 8 (prompt, step) points, compiles logits_dump
+./run_correctness.sh           # ~15 min: reference logits at 9 (prompt, step) points, compiles logits_dump
 ./run_eval.sh                  # ~40 min: downstream check
-python3 analyze.py             # out/results.json and the tables
+python3 analyze.py             # out/results.json
+python3 tables.py              # ../tables/*.tex (table bodies used by main.tex)
 python3 figures.py             # ../figs/{context,ablation,breakdown}.pdf
+cd .. && pdflatex main && bibtex main && pdflatex main && pdflatex main
 \end{lstlisting}
 The scripts anchor paths on their own location, stop on the first missing
 prerequisite or failed command, and write every raw log to

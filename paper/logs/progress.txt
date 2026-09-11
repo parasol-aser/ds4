@@ -14,3 +14,11 @@
 [01:07:32] ppl/prefill Q8 done
 [01:26:40] ALL DONE
 CHAIN DONE
+[08:01:17] mlx ctx rep 1 done
+[08:01:17] mlx ctx rep 2 done
+[08:01:17] mlx ctx rep 3 done
+MLX REDO DONE
+[08:12:45] mlx ctx rep 1 done
+[08:18:17] mlx ctx rep 2 done
+[08:23:49] mlx ctx rep 3 done
+MLX REDO2 DONE

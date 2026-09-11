@@ -21,8 +21,8 @@ for f in ['Q4', 'Q40', 'UD', 'Q8']:
     if f not in H: continue
     h = H[f]; p = P.get(f, {})
     pre = f"{p.get('ds4', float('nan')):.0f} / {p.get('llama', float('nan')):.0f}" if p else 'n/a'
-    rows.append(f"{names[f]} & {m(h['ds4_greedy_forward'])} & {m(h['ds4_greedy_loop'])} & {m(h['llama_greedy_forward'])} & {m(h['llama_default_loop'])} & {m(h['llama_matched_loop'])} & {pre} \\\\")
-w('headline.tex', '\n'.join(rows), 7)
+    rows.append(f"{names[f]} & {m(h['ds4_greedy_forward'])} & {m(h['ds4_greedy_loop'])} & {m(h['ds4_sampled_loop'])} & {m(h['llama_greedy_forward'])} & {m(h['llama_default_loop'])} & {m(h['llama_matched_loop'])} & {pre} \\\\")
+w('headline.tex', '\n'.join(rows), 8)
 # sampler costs
 s = H.get('Q4', {})
 w('sampler.tex', f"{m(s.get('ds4_sampled_sampler'),2)} & {m(s.get('llama_default_sampler'),2)} & {m(s.get('llama_matched_sampler'),2)}\n")
@@ -55,14 +55,15 @@ for tag in ['short', 'long', 'ctx8k']:
         key = f'{tag}_s{st}'
         if key in K and 'mean' in K[key]:
             v = K[key]
-            if key == 'short_s63': continue   # greedy histories diverge at token 46 on Q4_K; not a like-for-like point
+            if not v['argmax']: continue   # histories diverged before this step (see the .out texts); not a like-for-like point
             rows.append(f"{labels[tag]} & {st} & {v['mean']:.4f} & {v['max']:.3f} & {v['kl']:.1e} & {'agrees' if v['argmax'] else 'DIFFERS'} \\\\")
 w('correctness.tex', '\n'.join(rows), 6)
 
 # perplexity
 PP = R.get('ppl', {}); PD = R.get('ppl_paired', {})
 def ppl(f): x = PP.get(f); return 'n/a' if not x else (f"${x['ppl']:.2f} \\pm {x['se']:.2f}$" if x.get('se') else f"{x['ppl']:.2f}")
-def pd(k): x = PD.get(k); return '' if not x else f"${100*(x['ppl_ratio']-1):+.1f}\\% \\pm {100*x['se']:.1f}$"
+def pd(k):   # relative perplexity change exp(d)-1 with the delta-method standard error exp(d)*se
+    x = PD.get(k); return '' if not x else f"${100*(x['ppl_ratio']-1):+.1f}\\% \\pm {100*x['ppl_ratio']*x['se']:.1f}$"
 rows = [f"pure Q4\\_K, imatrix & 0.5625 & {ppl('Q4')} & \\\\",
         f"UD-Q4\\_K\\_M & 0.58 & {ppl('UD')} & {pd('UD-Q4')} \\\\",
         f"Q8\\_0 & 1.0625 & {ppl('Q8')} & {pd('Q8-Q4')} \\\\",

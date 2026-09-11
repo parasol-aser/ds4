@@ -5,8 +5,9 @@ and run_correctness.sh, and print the tables.
 Timing conventions (see the paper's timing figure):
   forward  = milliseconds per decode forward (GPU eval of one token; 63 forwards in a 64-token run)
   loop     = milliseconds per decode forward of the whole generation loop (sampling and emission included)
-ds4 reports both through DS4_TOKEN_TIMING; llama.cpp through its 'eval time' and 'sampling time' lines;
-MLX only the loop. Rates are 1000 / mean ms."""
+ds4's forward is the host-elapsed time of the forward call (DS4_TOKEN_TIMING); llama.cpp's is its 'eval time'
+per run and its loop proxy adds 'sampling time'; mlx-lm reports n output tokens over the time of n-1 forwards,
+so its rate is converted with n/(n-1). Rates are 1000 / mean ms."""
 import re, glob, os, json, math, statistics as st, collections
 
 OUT = os.environ.get('OUT', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'out'))
@@ -29,7 +30,7 @@ def ds4_greedy(p):
     t = read(p)
     ev = [float(x) for x in re.findall(r'decode eval \d+ took ([\d.]+) ms', t)]
     g = re.search(r'generation: ([\d.]+) t/s', t)
-    fwd = st.mean(ev[1:]) if len(ev) > 2 else (st.mean(ev) if ev else None)
+    fwd = st.mean(ev) if ev else None      # all 63 decode forwards, as for llama.cpp
     loop = (64.0 / float(g.group(1))) / 63 * 1000 if g else None
     return fwd, loop
 
@@ -57,8 +58,9 @@ def mlx(p):
     g = re.search(r'Generation: (\d+) tokens, ([\d.]+) tokens-per-sec', t)
     q = re.search(r'Prompt: (\d+) tokens, ([\d.]+) tokens-per-sec', t)
     if not g: return None
-    return {'loop': 1000 / float(g.group(2)), 'prefill_tps': float(q.group(2)) if q else None,
-            'prompt_tokens': int(q.group(1)) if q else None, 'gen_tokens': int(g.group(1))}
+    n = int(g.group(1))   # mlx-lm reports n output tokens over the time of n-1 decode forwards
+    return {'loop': 1000 * n / ((n - 1) * float(g.group(2))) if n > 1 else None, 'prefill_tps': float(q.group(2)) if q else None,
+            'prompt_tokens': int(q.group(1)) if q else None, 'gen_tokens': n}
 
 def tail_text(x): return x.split('</think>')[-1].strip()
 
@@ -100,7 +102,7 @@ for f in ['Q4', 'Q40', 'UD', 'Q8']:
 # ---------------- context sweep ----------------
 R['context'] = {}
 for n in ['1k', '4k', '8k', '16k', '32k']:
-    d = []; dp = []; l = []; lp = []; m = []; mp = []; ntok = None
+    d = []; dp = []; l = []; lp = []; m = []; mp = []; mg = []; mt = []; ntok = None
     for p in sorted(glob.glob(f'{L}/ds4_ctx_{n}_*.log')):
         t = read(p); g = re.search(r'prefill: ([\d.]+) t/s, generation: ([\d.]+) t/s', t)
         if g: d.append((64.0 / float(g.group(2))) / 63 * 1000); dp.append(float(g.group(1)))
@@ -109,10 +111,11 @@ for n in ['1k', '4k', '8k', '16k', '32k']:
         if x: l.append(x['forward']); lp.append(x['prefill_tps']); ntok = x['prompt_tokens']
     for p in sorted(glob.glob(f'{L}/mlx_ctx_{n}_*.log')):
         x = mlx(p)
-        if x: m.append(x['loop']); mp.append(x['prefill_tps'])
+        if x: m.append(x['loop']); mp.append(x['prefill_tps']); mg.append(x['gen_tokens']); mt.append(x['prompt_tokens'])
     if d or l:
         R['context'][n] = {'prompt_tokens': ntok, 'ds4_loop': mean_sd(d), 'ds4_prefill': mean_sd(dp),
-                           'llama_forward': mean_sd(l), 'llama_prefill': mean_sd(lp), 'mlx_loop': mean_sd(m), 'mlx_prefill': mean_sd(mp)}
+                           'llama_forward': mean_sd(l), 'llama_prefill': mean_sd(lp), 'mlx_loop': mean_sd(m), 'mlx_prefill': mean_sd(mp),
+                           'mlx_prompt_tokens': sorted(set(mt)), 'mlx_gen_tokens': sorted(set(mg))}
 
 # ---------------- ablation ----------------
 ABL = [('baseline', 'all optimizations on'), ('no_fused_swiglu', 'no fused gate/up SwiGLU'),

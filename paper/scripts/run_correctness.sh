@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Reference-logit comparison at several decode steps and context lengths.
 # Step k means: prefill, then k generated tokens fed back; the dumped logits are those that pick token k+1.
-set -eu
+set -eu -o pipefail
 HERE=${0:A:h}
 # repository root: nearest ancestor of this script that contains ds4.c (works for paper/scripts and misc/paper/scripts)
 find_root() { d=$1; while [ "$d" != "/" ]; do [ -f "$d/ds4.c" ] && { echo "$d"; return; }; d=${d:h}; done; echo "$1"; }
@@ -16,7 +16,13 @@ cd "$DS4_ROOT"
 cor() { tag=$1; pfile=$2; step=$3; c=$4
   DS4_QWEN_LOGIT_DUMP_STEP=$step DS4_GLM_LOGIT_DUMP="$L/ds4_${tag}_s$step.bin" ./ds4 -m "$M" --prompt-file "$pfile" -n 64 --temp 0 -c $c > "$L/ds4_${tag}_s$step.out" 2>/dev/null
   "$OUT/logits_dump" "$M" "@$pfile" 64 5 $step "$L/ref_${tag}_s$step.bin" > "$L/ref_${tag}_s$step.txt" 2>&1
-  python3 "$HERE/cmp.py" "$L/ds4_${tag}_s$step.bin" "$L/ref_${tag}_s$step.bin" | tee "$L/cmp_${tag}_s$step.txt"
+  python3 "$HERE/cmp.py" "$L/ds4_${tag}_s$step.bin" "$L/ref_${tag}_s$step.bin" > "$L/cmp_${tag}_s$step.txt" 2>&1; rc=$?
+  cat "$L/cmp_${tag}_s$step.txt"
+  case $rc in
+    0) ;;
+    1) echo "argmax differs at $tag step $step (greedy histories may have diverged; the table excludes such points)";;
+    *) echo "comparison failed at $tag step $step"; exit 1;;
+  esac
 }
 for st in 0 4 16 40 63; do cor short "$L/prompt_short.txt" $st 4096; done
 for st in 0 4 63; do cor long "$HERE/prompt_1439.txt" $st 4096; done

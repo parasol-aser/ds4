@@ -1,3 +1,3 @@
 ds4 top5: 421:24.9322 364:24.8892 11:22.7476 310:22.4781 1680:20.4394
 ref top5: 421:24.8705 364:24.8269 11:22.7186 310:22.4143 1680:20.4096
-max|diff|=0.1992 mean|diff|=0.01381 KL(ds4||ref)=3.50e-05 argmax_match=True
+max|diff|=0.1992 mean|diff|=0.01381 KL(ds4||ref)=3.52e-05 argmax_match=True

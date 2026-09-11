@@ -8,6 +8,8 @@ HERE=${0:A:h}
 find_root() { d=$1; while [ "$d" != "/" ]; do [ -f "$d/ds4.c" ] && { echo "$d"; return; }; d=${d:h}; done; echo "$1"; }
 DS4_ROOT=${DS4_ROOT:-$(find_root "$HERE")}; OUT=${OUT:-$HERE/out}; L=$OUT/logs; mkdir -p "$L"
 LL=${LLAMA_BIN:-$HOME/github/llama.cpp/build/bin}
+PY=${PYTHON:-python3}   # interpreter with mlx-lm and huggingface_hub (we used miniconda Python 3.11)
+shasum -a 256 "$OUT"/prompt_*.txt "$HERE/prompt_1439.txt" "$OUT/wikitext-2-raw-v1.zip" "$OUT/wikitext-2-raw/wiki.test.raw" > "$L/prompt_sha256.txt" 2>/dev/null || true
 for x in "$DS4_ROOT/ds4" "$LL/llama-completion" "$LL/llama-perplexity" "$OUT/prompt_32k.txt" "$OUT/wikitext-2-raw/wiki.test.raw"; do
   [ -e "$x" ] || { echo "missing: $x (build ds4 and llama.cpp, run make_prompts.py, fetch wikitext-2)"; exit 1; }
 done
@@ -17,7 +19,7 @@ DS=$DS4_ROOT/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-im
 for x in $Q4 $Q40 $UD $Q8; do [ -f "$x" ] || { echo "missing model: $x"; exit 1; }; done
 SHORT=$'<|im_start|>user\nWrite a short paragraph about the ocean.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n'
 printf '%s' "$SHORT" > "$L/prompt_short.txt"
-MLX=$(python3 -c "from huggingface_hub import snapshot_download; print(snapshot_download('mlx-community/Qwen3.8-27B-4bit'))")
+MLX=$($PY -c "from huggingface_hub import snapshot_download; print(snapshot_download('mlx-community/Qwen3.8-27B-4bit', revision='3e6447f082e89cc7f0bc6e5441afd38dfce760ff'))")
 cd "$DS4_ROOT"
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$L/progress.txt"; }
 ctx() { case $1 in 1k) echo 2048;; 4k) echo 5120;; 8k) echo 9216;; 16k) echo 18432;; 32k) echo 34816;; esac; }
@@ -38,7 +40,7 @@ for f in Q4 Q40 UD Q8; do
   log "headline $f done"
 done
 for i in 1 2 3 4 5; do
-  python3 -m mlx_lm generate --model "$MLX" --prompt "$SHORT" --max-tokens 64 --temp 0.0 --ignore-chat-template > "$L/mlx_short_$i.log" 2>&1
+  $PY -m mlx_lm generate --model "$MLX" --prompt "$SHORT" --max-tokens 64 --temp 0.0 --ignore-chat-template > "$L/mlx_short_$i.log" 2>&1
 done
 log "mlx short done"
 
@@ -47,7 +49,8 @@ for rep in 1 2 3; do
   for n in 1k 4k 8k 16k 32k; do
     ./ds4 -m $Q4 --prompt-file "$OUT/prompt_$n.txt" -n 64 --temp 0 -c $(ctx $n) > /dev/null 2> "$L/ds4_ctx_${n}_$rep.log"
     $LL/llama-completion -m $Q4 -f "$OUT/prompt_$n.txt" -n 64 --temp 0 -c $(ctx $n) -no-cnv --no-warmup > /dev/null 2> "$L/llama_ctx_${n}_$rep.log"
-    python3 -m mlx_lm generate --model "$MLX" --prompt "$(cat "$OUT/prompt_$n.txt")" --max-tokens 64 --temp 0.0 --ignore-chat-template > "$L/mlx_ctx_${n}_$rep.log" 2>&1
+    # prompt through stdin: a "$(cat ...)" substitution would strip the file's trailing newlines
+    $PY -m mlx_lm generate --model "$MLX" --prompt - --max-tokens 64 --temp 0.0 --ignore-chat-template < "$OUT/prompt_$n.txt" > "$L/mlx_ctx_${n}_$rep.log" 2>&1
   done
   log "context rep $rep done"
 done
@@ -84,7 +87,7 @@ for f in Q4 Q40 UD Q8; do
   ./ds4 -m $m --prompt-file "$HERE/prompt_1439.txt" -n 8 --temp 0 -c 4096 > /dev/null 2> "$L/ds4_prefill_$f.log"
   log "ppl/prefill $f done"
 done
-MLX_MODEL="$MLX" python3 "$HERE/mlx_ppl.py" "$OUT/wikitext-2-raw/wiki.test.raw" 40 > "$L/mlx_ppl.log" 2>&1
+MLX_MODEL="$MLX" $PY "$HERE/mlx_ppl.py" "$OUT/wikitext-2-raw/wiki.test.raw" 40 > "$L/mlx_ppl.log" 2>&1
 
 # 6. DeepSeek V4 Flash (skipped if the file is absent)
 if [ -f "$DS" ]; then

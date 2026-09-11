@@ -1,27 +1,20 @@
 % Timing model: what each reported quantity covers.
-\begin{tikzpicture}[x=1cm,y=1cm,font=\scriptsize,
-  gpu/.style={draw,fill=black!15,minimum height=0.45cm,inner sep=0pt},
-  cpu/.style={draw,fill=black!45,minimum height=0.45cm,inner sep=0pt},
+\begin{tikzpicture}[x=1cm,y=1cm,font=\small,
+  gpu/.style={draw,fill=black!15,minimum height=0.5cm,inner sep=2pt},
+  cpu/.style={draw,fill=black!45,minimum height=0.5cm,inner sep=2pt},
   brace/.style={decorate,decoration={brace,amplitude=3pt}}]
-  % GPU row
   \node[anchor=east] at (-0.1,1.0) {GPU};
-  \node[gpu,minimum width=1.6cm,anchor=west] (pf) at (0,1.0) {prefill};
-  \node[gpu,minimum width=1.9cm,anchor=west] (f1) at (2.2,1.0) {forward 1};
-  \node[gpu,minimum width=1.9cm,anchor=west] (f2) at (4.7,1.0) {forward 2};
-  \node[anchor=west] at (7.0,1.0) {$\cdots$};
-  \node[gpu,minimum width=1.9cm,anchor=west] (f63) at (7.9,1.0) {forward 63};
-  % CPU row
+  \node[gpu,minimum width=1.5cm,anchor=west] (pf) at (0,1.0) {prefill};
+  \node[gpu,minimum width=2.0cm,anchor=west] (f1) at (2.2,1.0) {forward 1};
+  \node[gpu,minimum width=2.0cm,anchor=west] (f2) at (4.9,1.0) {forward 2};
+  \node[anchor=west] at (7.3,1.0) {$\cdots$};
+  \node[gpu,minimum width=2.0cm,anchor=west] (f63) at (8.3,1.0) {forward 63};
   \node[anchor=east] at (-0.1,0.2) {CPU};
-  \node[cpu,minimum width=0.5cm,anchor=west] (s0) at (1.65,0.2) {\textcolor{white}{s}};
-  \node[cpu,minimum width=0.5cm,anchor=west] (s1) at (4.15,0.2) {\textcolor{white}{s}};
-  \node[cpu,minimum width=0.5cm,anchor=west] (s2) at (6.65,0.2) {\textcolor{white}{s}};
-  \node[cpu,minimum width=0.5cm,anchor=west] (s63) at (9.85,0.2) {\textcolor{white}{s}};
-  \node[anchor=west,align=left] at (10.5,0.2) {s = sample + emit\\(token $k$)};
-  % braces
-  \draw[brace] (2.2,1.35) -- (4.1,1.35) node[midway,above=3pt] {forward-only: GPU eval per decode forward};
-  \draw[brace] (4.7,-0.25) -- (6.6,-0.25) node[midway,below=3pt] {command buffer: GPU spans per stage (\S\ref{sec:method})};
-  \draw[brace] (1.65,-0.85) -- (10.35,-0.85) node[midway,below=3pt] {generation loop: 63 forwards + 64 samples/emits, reported per forward};
-  \node[anchor=west,align=left] at (0,-1.7) {Token 1 is sampled from the prefill logits; a 64-token run performs 63 decode forwards.
-  ds4's loop time comes from the CLI (\texttt{DS4\_TOKEN\_TIMING} splits it into sample, emit, forward);
-  llama.cpp's from its \emph{eval time} (forward-only) plus \emph{sampling time}. MLX reports only the loop.};
+  \node[cpu,minimum width=0.55cm,anchor=west] (s0) at (1.6,0.2) {\textcolor{white}{s}};
+  \node[cpu,minimum width=0.55cm,anchor=west] (s1) at (4.3,0.2) {\textcolor{white}{s}};
+  \node[cpu,minimum width=0.55cm,anchor=west] (s2) at (7.0,0.2) {\textcolor{white}{s}};
+  \node[cpu,minimum width=0.55cm,anchor=west] (s63) at (10.4,0.2) {\textcolor{white}{s}};
+  \draw[brace] (2.2,1.4) -- (4.2,1.4) node[midway,above=3pt] {forward-call elapsed time (one decode forward)};
+  \draw[brace] (4.9,-0.2) -- (6.9,-0.2) node[midway,below=3pt] {command buffers: GPU spans per stage (\S\ref{sec:method})};
+  \draw[brace] (1.6,-0.9) -- (10.95,-0.9) node[midway,below=3pt] {generation loop: 63 forwards and 64 samples (s) and emissions, reported per forward};
 \end{tikzpicture}
