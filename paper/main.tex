@@ -25,33 +25,31 @@
 \maketitle
 
 \begin{abstract}
-Open-weight models in the 20--30B range now run on personal machines, and
-Apple silicon with unified memory holds one in a single address space; for
-the people who run them, the metric that matters is the latency of a single
-decode stream. That latency is usually modeled as memory bandwidth: every
-step reads every active weight, so the step should take model bytes over
-bandwidth, and the engines that run these models are built and compared on
-that assumption. On Qwen3.8-27B in Q4\_K on an M2~Ultra the most widely
-used runner takes 42~ms per step, against about 24~ms to stream the weights
-at the best rates this GPU achieves, and neither the bandwidth model nor the
-standard profilers say where the difference goes. We build an instrument
-that does: per-stage GPU timestamps from the command buffer, a CPU split of
-the path between tokens, and reference logits at chosen decode steps. It
-shows that a 27B step is not one large stream but about a thousand small
-kernels, that per-dispatch overhead, matvec shape and CPU work between
-tokens each cost milliseconds, and that the matvecs are limited by
-activation traffic rather than by occupancy or dequantization. Inside
-\ds{}, an open-source model-specific C/Metal engine, we add the model and
-act on each finding behind a runtime switch. The switches shorten the step
-from 35.0 to 30.8~ms; the engine takes 30.6~ms per forward against
-llama.cpp's 42.3, with logits matching llama.cpp at eight decode-step and
-context-length points. A controlled experiment with the same checkpoint in
-Q4\_0 and Q4\_K shows the block format is worth 8--16\% with simple kernels
-and 2--3\% once the large matvecs are fused, so a format must be judged with
-the kernels that read it; and a 2~ms sampler cost from \texttt{isfinite}
-under \texttt{-ffast-math} shows that the CPU gap has to be measured on its
-own. We report what did not work and why, and release the code, switches,
-logs and scripts.
+Open-weight models of 20--30B parameters now run on personal machines, and
+Apple silicon holds one in unified memory; what their users pay is the
+latency of a single decode stream. That latency is usually modeled as
+memory bandwidth: each step reads every active weight, so it should take
+model bytes over bandwidth. On Qwen3.8-27B in Q4\_K on an M2~Ultra,
+streaming the weights at the best rates this GPU achieves takes about
+24~ms, yet llama.cpp takes 42~ms per step, and neither the bandwidth model
+nor the standard profilers say where the difference goes. We build an
+instrument that does: per-stage GPU timestamps from the command buffer, a
+CPU split of the path between tokens, and reference logits at chosen decode
+steps. It shows that a 27B step is about a thousand small kernels rather
+than one stream, that dispatch overhead, matvec shape and CPU work between
+tokens each cost milliseconds, and, with ablations, that the matvecs are
+limited by activation traffic rather than occupancy or dequantization.
+Acting on each finding in \ds{}, an open-source model-specific C/Metal
+engine, behind runtime switches, we shorten the step from 35.0 to 30.8~ms;
+the engine takes 30.6~ms per forward against llama.cpp's 42.3, with logits
+matching llama.cpp at eight decode-step and context-length points. Two
+results reach beyond this engine. With the same checkpoint in Q4\_0 and
+Q4\_K, the cheaper block format is worth 8--16\% under simple kernels and
+2--3\% once the large matvecs are fused: a format must be judged with the
+kernels that read it. And a 2.2~ms per-token sampler cost, an
+\texttt{isfinite} left as a library call under \texttt{-ffast-math}, shows
+that the CPU gap must be measured on its own. We report what did not work
+and why, and release the code, switches, logs and scripts.
 \end{abstract}
 
 \section{Introduction}
