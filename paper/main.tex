@@ -25,29 +25,31 @@
 \maketitle
 
 \begin{abstract}
-Large language models are increasingly run on personal machines, and Apple
-silicon with unified memory holds a 25--100B-parameter model in one address
-space. Single-stream decode there is usually called memory-bandwidth bound,
-yet a widely used runner spends 42~ms per decode step on Qwen3.8-27B in
-Q4\_K on an M2~Ultra, against an estimated 24~ms to stream the active
-weights at the best rates the GPU achieves.
-We ask where the rest goes. We decompose a decode step into weight streaming,
-matvec kernel efficiency, per-dispatch overhead and CPU work between tokens,
-timing stages with command-buffer GPU timestamps so that sub-millisecond
-kernels are attributed correctly, and we find that each of the last three
-costs milliseconds at this scale. Inside \ds{}, an open-source model-specific
-C/Metal engine, we add the model and pull three levers, each behind a runtime
-switch: fewer bytes per token, fewer and better-shaped dispatches, and a
-shorter CPU path between tokens. Our optimizations shorten the step from
-35.0 to 30.8~ms; forward-only, \ds{} takes 30.6~ms against llama.cpp's 42.3,
-with logits matching llama.cpp at eight decode-step and context-length points.
-A controlled experiment with the same source checkpoint in Q4\_0 and Q4\_K
-shows the block format is worth 8--16\% with simple kernels and 2--3\% once
-the large matvecs are fused; MLX reaches a comparable step time on its affine
-4-bit conversion. A 2~ms-per-token cost in the sampler,
-caused by \texttt{isfinite} under \texttt{-ffast-math}, shows that the CPU
-gap between tokens must be measured on its own. We report negative results
-with their mechanisms and release code, switches, logs and scripts.
+Open-weight models in the 20--30B range now run on personal machines, and
+Apple silicon with unified memory holds one in a single address space.
+Single-stream decode there is usually called memory-bandwidth bound: every
+step reads every active weight, so the step time should be model bytes over
+bandwidth. Yet a widely used runner spends 42~ms per decode step on
+Qwen3.8-27B in Q4\_K on an M2~Ultra, against about 24~ms to stream the
+weights at the best rates this GPU achieves. This paper asks where the rest
+goes. We decompose a decode step into weight streaming, matvec kernel
+efficiency, per-dispatch overhead and CPU work between tokens, timing each
+stage with command-buffer GPU timestamps so that sub-millisecond kernels are
+attributed correctly, and find that each of the last three costs milliseconds
+at this scale. Inside \ds{}, an open-source model-specific C/Metal engine, we
+add the model and pull three levers, each behind a runtime switch: fewer
+bytes per token, fewer and better-shaped dispatches, and a shorter CPU path
+between tokens. The switches are worth 4.2~ms of a 35.0~ms step; the
+resulting engine takes 30.6~ms per forward against llama.cpp's 42.3, with
+logits matching llama.cpp at eight decode-step and context-length points.
+Two findings reach beyond this engine. A controlled experiment with the same
+source checkpoint in Q4\_0 and Q4\_K shows that the block format is worth
+8--16\% with simple kernels and 2--3\% once the large matvecs are fused, so
+format and kernel design must be judged together. And a 2~ms-per-token cost
+hiding in the sampler, an \texttt{isfinite} call left standing under
+\texttt{-ffast-math}, shows that the CPU gap between tokens has to be
+measured on its own. We report the optimizations that did not help and why,
+and release the code, switches, logs and scripts.
 \end{abstract}
 
 \section{Introduction}
@@ -55,16 +57,16 @@ with their mechanisms and release code, switches, logs and scripts.
 
 Open-weight models in the 20--30B range fit on a laptop or desktop with
 64--192~GB of unified memory, and people run them locally for chat, coding
-agents and private workloads. The question on such a machine is no longer
+agents and private workloads. On such a machine the question is no longer
 whether a model fits but how fast it decodes, and the standard answer is a
 roofline argument: a single-stream decode step reads every active weight
 matrix once, so the step time is bounded below by model bytes over memory
 bandwidth. For Qwen3.8-27B in Q4\_K on an M2~Ultra that is 15.06~GB per step
-at a nominal 800~GB/s, or 18.8~ms; using the streaming rates we measure for
-each format on this GPU, about 24.3~ms (\S\ref{sec:roofline}). llama.cpp takes
-42.3~ms per decode step (\S\ref{sec:eval}). Roughly 18~ms of every step is
-not accounted for by streaming the weights, and this paper is about where it
-goes.
+at a nominal 800~GB/s, or 18.8~ms; using the best streaming rate we measure
+for each weight format on this GPU, about 24.3~ms (\S\ref{sec:roofline}).
+llama.cpp takes 42.3~ms per decode step (\S\ref{sec:eval}). Roughly 18~ms of
+every step is not accounted for by streaming the weights, and this paper is
+about where it goes.
 
 That time is hard to see, which is why it persists. A profiler that
 synchronizes at stage boundaries pays about 0.16~ms per boundary on this
@@ -75,49 +77,70 @@ reached; it is not, because a kernel that is running is not necessarily a
 kernel that is streaming at full rate. And a 2~ms cost per token in the CPU
 sampler, one fifteenth of the step, is invisible to every GPU-side tool. Our
 first contribution is an instrument that makes each of these visible: GPU
-timestamps of the command buffer for each stage, a CPU inter-token split, and
-reference logits from llama.cpp at chosen decode steps, so that every change
-is checked where decode actually runs (\S\ref{sec:method}).
+timestamps of the command buffer for each stage, a CPU split of the
+inter-token path into forward, sampling and emission, and reference logits
+from llama.cpp at chosen decode steps, so that every change is checked where
+decode actually runs (\S\ref{sec:method}).
 
-With that instrument we add the model to \ds{}, an open-source model-specific
-engine in C and Metal, and pull three levers, each behind a switch so the final
-build can reproduce any subset (\S\ref{sec:opt}): the bytes per step and how
-fast they move (quantization format and matvec inner loop); the number and
-shape of dispatches (a layer's four side projections in one launch, the
-SwiGLU gate and up in one kernel, each residual add fused into the norm that
-consumes it, and split-KV attention scaled to the context); and the CPU path
-between tokens. Switching everything off reproduces the pre-optimization
-build (35.0~ms per step in the generation-loop definition of
-\S\ref{sec:method}); everything on gives 30.8~ms, or 30.6~ms forward-only,
-about 80\% of the estimated streaming bound.
+With that instrument we add the model to \ds{}, an open-source
+model-specific engine in C and Metal, and pull three levers, each behind a
+switch so the final build can reproduce any subset (\S\ref{sec:opt}): the
+bytes per step and how fast they move (quantization format and matvec inner
+loop); the number and shape of dispatches (a layer's four side projections
+in one launch, the SwiGLU gate and up in one kernel, each residual add fused
+into the norm that consumes it, and split-KV attention scaled to the
+context); and the CPU path between tokens. With the six GPU switches off the
+step takes 35.0~ms (generation-loop definition, \S\ref{sec:method}); with
+everything on, 30.8~ms, or 30.6~ms forward-only, so the estimated streaming
+reference is 79\% of the step.
 
-Our contributions, and what we learned from each:
+Four findings are, we think, more useful than the speedup.
+\begin{itemize}
+\item \textbf{At 27B scale, dispatch count is a first-order term.} The
+  initial graph issued about 1,070 dispatches per step; at a few
+  microseconds of ramp and drain each, that is as much time as the
+  recurrence, the attention and every norm together. The fusions bring it to
+  about 620, and the fused gate/up kernel alone is worth 2.1~ms leave-one-out
+  (\S\ref{sec:anatomy}, Figure~\ref{fig:ablation}).
+\item \textbf{The Q4\_K matvecs are limited by activation traffic, not
+  occupancy.} Spreading a reduction over more threads did nothing for the
+  wide projections; reading the activation once per four rows instead of
+  two, and reading it as vectors, did. The best Q4\_K kernel ends at
+  616~GB/s effective against 670 for the Q8\_0 head, and the difference is
+  dequantization work (\S\ref{sec:opt}, \S\ref{sec:negative}).
+\item \textbf{Format and fusion are not additive.} With simple kernels the
+  cheaper Q4\_0 block format is worth 16\% in llama.cpp and 8\% in \ds{};
+  with the fused kernels it is worth 2--3\%, because the largest projection
+  then streams at the same effective rate in both formats, while Q4\_0 costs
+  about 4\% in perplexity. Which lever matters depends on how far the
+  kernels already are from the streaming reference (\S\ref{sec:q40}). MLX,
+  a general framework on its own affine 4-bit conversion, reaches a step
+  time within about 1~ms of ours.
+\item \textbf{The CPU is on the critical path.} The 2~ms sampler cost was an
+  \texttt{isfinite} call left as a library function by \texttt{-ffast-math};
+  the first fix was folded away by the same flags and broke NaN handling.
+  The rewritten sampler costs 0.41~ms, and llama.cpp's own full-vocabulary
+  top-$p$ sampler 1.2~ms, per token (\S\ref{sec:cpu}). Both facts are
+  general to inference code built that way.
+\end{itemize}
+
+Our contributions are:
 \begin{enumerate}
 \item \textbf{A measurement method for Metal decode} with matched timing
-  definitions across engines and a correctness protocol at arbitrary decode
-  steps (\S\ref{sec:method}, \S\ref{sec:correctness}). The per-dispatch cost
-  it exposes is a first-order term at 27B scale: the original graph issued
-  about 1,070 dispatches per step, comparable in time to the recurrence,
-  the attention and every norm together.
+  definitions across engines, per-stage GPU spans, a CPU inter-token split
+  and a correctness protocol at chosen decode steps (\S\ref{sec:method},
+  \S\ref{sec:correctness}).
 \item \textbf{Qwen3.8-27B support and a set of decode optimizations}, each
-  measured in isolation (\S\ref{sec:opt}, Figure~\ref{fig:ablation}). Their
-  leave-one-out effects are consistent with activation traffic, not
-  occupancy, limiting the Q4\_K matvecs: spreading a reduction over more
-  threads did nothing for the wide projections, while reading the activation
-  once per four rows instead of two, as vectors, did.
+  behind a switch and each measured in isolation (\S\ref{sec:opt},
+  Figure~\ref{fig:ablation}). The switches account for 12\% of the step
+  within one engine and weight file; the remaining difference to llama.cpp
+  is a comparison of complete engines that we do not decompose.
 \item \textbf{A controlled quantization-format experiment}
-  (\S\ref{sec:q40}) with the same source checkpoint in Q4\_0 and Q4\_K, in
-  two engines and at two kernel-fusion levels. The format is worth 16\% in
-  llama.cpp and 8\% in \ds{} with simple kernels, and 2--3\% once the large
-  matvecs are fused; which lever matters depends on how far the kernels are
-  from the streaming bound. MLX, on its affine 4-bit conversion with a
-  smaller output head, reaches a comparable step time from a general
-  framework.
-\item \textbf{The CPU path as a measured term} (\S\ref{sec:cpu}). A 2~ms
-  sampler cost came from \texttt{isfinite} being left as a library call under
-  \texttt{-ffast-math}; a first replacement was folded away by the same flags
-  and broke NaN handling. llama.cpp's own full-vocabulary top-$p$ sampler
-  costs 1.2~ms per token with the same sampling settings.
+  (\S\ref{sec:q40}) with the same source checkpoint, importance matrix and
+  output head in Q4\_0 and Q4\_K, in two engines and at two kernel-fusion
+  levels, with the quality cost measured alongside.
+\item \textbf{The CPU path as a measured term} (\S\ref{sec:cpu}), including
+  the sampler bug, its mechanism and its cost in both engines.
 \item \textbf{Negative results with mechanisms} (\S\ref{sec:negative}), a
   profile of a mixture-of-experts model on the same instrument, and the
   code, switches, logs and scripts (Appendix~\ref{sec:repro}).
@@ -129,14 +152,15 @@ Metal schedules rather than interpreting a generic GGUF computation graph; by
 ``model-specific'' we mean that the per-token dispatch list is written for the
 model, so fusions that depend on the model or the session are local changes.
 Our work adds Qwen3.8-27B, including its Gated DeltaNet and gated-attention
-kernels, and the decode paths and measurements described here; the branches,
-scripts and logs are at \branchurl{}.
+kernels, and the decode paths and measurements described here; the engine's
+existing design is part of what we measure. The branches, scripts and logs
+are at \branchurl{}.
 
 \section{Background}
 \label{sec:background}
 
 \subsection{Platform and setup}
-The M-series SoCs share one LPDDR5 pool between CPU and GPU. Metal compiles
+The M2~Ultra CPU and GPU share an LPDDR5 memory pool. Metal compiles
 kernels at runtime and executes them from command buffers; a compute encoder
 holds many dispatches, which execute in order with memory ordering. There is
 no host-to-device copy, but the CPU and the GPU share bandwidth, and CPU work
@@ -208,11 +232,13 @@ and the fastest Q4\_K kernel, the fused gate/up projection, moves 100.3~MB in
 T_{\text{weights}} \approx \frac{13.71\,\text{GB}}{616\,\text{GB/s}} + \frac{1.35\,\text{GB}}{670\,\text{GB/s}} \approx 24.3\ \text{ms},
 \]
 which we call the estimated weight-streaming bound. It assumes every matrix
-shape streams at the best measured rate for its format and excludes all other
-work, so it is a bound, not a partition: kernel time below it includes weight
-traffic, and a slower kernel still spends time moving weights. Throughout,
-``utilization'' of this bound means $24.3$~ms divided by the measured step
-time.
+shape streams at the best measured rate for its format and excludes work
+outside the matvecs. Because the rates come from complete kernels, they
+already include dequantization and kernel overhead. The estimate is an
+empirical reference, rather than a hardware lower bound or a partition of
+measured execution time. Throughout, ``utilization'' of this reference means
+$24.3$~ms divided by the measured step time; it is not a measurement of DRAM
+bandwidth utilization.
 
 \section{Measurement method}
 \label{sec:method}
@@ -317,10 +343,11 @@ and DeltaNet output) run at 390--450~GB/s with the ggml-style kernel. The
 Q8\_0 output head reaches 670~GB/s on the same memory system. Effective rate
 is bytes over kernel time, not a measurement of DRAM traffic; the difference
 between formats is consistent with the ALU cost of unpacking Q4\_K's 6-bit
-sub-block scales and minimums, and \S\ref{sec:q40} tests that directly.
+sub-block scales and minimums. Section~\ref{sec:q40} compares the formats
+under different kernel configurations to examine their interaction.
 
 \paragraph{Dispatch count matters at this scale.}
-The pre-optimization graph issued about 1,070 dispatches per step (16 per
+The initial model implementation issued about 1,070 dispatches per step (16 per
 DeltaNet layer, 19 per attention layer, plus embedding and head). At a few
 microseconds of ramp and drain each, that is 3--5~ms, as much as the
 recurrence, the attention and all norms together. The final graph issues about
@@ -488,7 +515,7 @@ $\exp(\bar d)\,\mathrm{SE}(\bar d)$ over 40 chunks. Bytes per weight are for the
 \subsection{Decode step time}
 Table~\ref{tab:tps} gives the headline comparison under both timing
 definitions. On pure Q4\_K, \ds{} takes 30.6~ms per decode forward against
-42.3 for llama.cpp, a 28\% shorter step; the estimated streaming bound of
+42.3 for llama.cpp, an approximately 28\% shorter step; the estimated streaming bound of
 24.3~ms is 79\% of it. The step is about 26~ms of weight-carrying matvecs at
 390--616~GB/s effective, 2~ms for the output head, and 2--3~ms of small
 kernels and per-dispatch ramp. On the mixed-recipe file the step is 16\%
@@ -521,13 +548,15 @@ setting, both as eval plus sampling time. The sampled comparison is therefore
 \label{tab:tps}
 \end{table}
 
-The pre-optimization build takes 35.0~ms per forward (generation-loop
-definition) on pure Q4\_K against 30.8 with everything on
-(Table~\ref{tab:ablation}), so the optimizations of \S\ref{sec:opt} shorten
-the step by 4.2~ms (12\%). The remaining difference to llama.cpp's 42.4 is
-the engine's existing design; the profiles of \S\ref{sec:anatomy} point at
-its shorter per-token dispatch list and CPU encode path, but we have not
-ablated those factors across engines.
+With the six switchable GPU optimizations disabled, \ds{} takes 35.0~ms
+per forward under the generation-loop definition on pure Q4\_K, compared
+with 30.8~ms when they are enabled (Table~\ref{tab:ablation}). This is a
+4.2~ms (12\%) reduction within the same engine and weight file. Both
+configurations retain the single attention prologue and the current CPU
+sampler. The comparison with llama.cpp measures the complete implementations;
+it does not isolate the causes of the remaining gap. The profiles of
+\S\ref{sec:anatomy} suggest a role for dispatch count and CPU encoding,
+but those factors were not ablated across engines.
 
 \subsection{Ablation}
 \begin{figure}[t]
@@ -549,11 +578,12 @@ The residual+norm fusion and the context-scaled attention are small at a
 \subsection{Context length and the MLX baseline}
 Figure~\ref{fig:context} sweeps the prompt from 1.4k to 33k tokens (values in
 Table~\ref{tab:context}, appendix; three runs each). \ds{}'s step grows from
-31.4 to 38.1~ms and llama.cpp's from 42.5 to 49.4. The DeltaNet layers cost
-the same at every length (Table~\ref{tab:stages}); the growth is the sixteen
-attention layers reading a K/V cache of 64~KiB per position summed over those
-layers, plus the split-KV reduce (0.96 to 3.36~ms per step from 20 to 8,590
-tokens). Prefill throughput is the same in \ds{} and llama.cpp within 4\% at
+31.4 to 38.1~ms and llama.cpp's from 42.5 to 49.4. The DeltaNet stages vary
+little between the short- and 8.6k-context profiles
+(Table~\ref{tab:stages}). The sixteen attention layers read a K/V cache
+of 64~KiB per position summed over those layers; their attention stage,
+including split-KV reduction, grows from 0.96 to 3.36~ms per step between
+20 and 8,590 tokens. Prefill throughput is the same in \ds{} and llama.cpp within 4\% at
 every length: prefill is a matrix--matrix workload on comparable
 dequantize-and-multiply kernels.
 
@@ -564,7 +594,7 @@ head, at 715~MB against our Q8\_0 head's 1.35~GB, about 1~ms per step at
 these rates; mlx-lm reports only the generation loop; and the model code is
 Python over the framework's primitives. On the same 20-token prompt its loop
 takes 29.8~ms per forward, comparable to \ds{}'s 30.7, and it tracks \ds{}
-across context lengths (30.4 to 37.1~ms, within 1~ms of \ds{} at every
+across context lengths (30.4 to 37.1~ms, within about 1~ms of \ds{} at every
 length) with prefill 13--18\% slower. The comparison shows
 that a general framework on a cheaper format reaches a similar step time; it
 does not isolate the format, which is what \S\ref{sec:q40} does.
@@ -578,7 +608,7 @@ each. \ds{} and llama.cpp on pure Q4\_K; MLX on its 4-bit affine conversion
 \label{fig:context}
 \end{figure}
 
-\subsection{The format lever: Q4\_0 against Q4\_K}
+\subsection{Quantization format and kernel organization}
 \label{sec:q40}
 To separate the quantization format from everything else we built two files
 from the same Q8\_0 source with the same importance matrix and the same
@@ -613,19 +643,22 @@ logits agree with llama.cpp to a mean $|\Delta|$ of 0.0009 at step 4, and its
 \label{tab:q40}
 \end{table}
 
-With simple kernels the format alone shortens the step by 16\% in llama.cpp
-and 8\% in \ds{}: the Q4\_0 gate/up pair takes 171~$\mu$s per layer against
-196 for Q4\_K. With the fused kernels the two formats land at 30.0 and
-30.8~ms, 2.5\% apart. The stage profile is consistent with a simple
-explanation: the fused gate/up kernel takes 166~$\mu$s in Q4\_0 and 163 in
-Q4\_K, both about
-610~GB/s effective, so on the largest projection the cheaper dequantization
-has nothing left to buy once the kernel is fused; Q4\_0 still gains on the
-narrower projections (84 against 94~$\mu$s for the DeltaNet projections, 75
-against 82 for attention) and loses on the FFN down projection (103 against
-95), which has a K-split kernel only for Q4\_K. The format lever matters in
-proportion to how far the kernels are from the streaming bound. It costs
-about 4\% in perplexity, the same trade the MLX conversion makes.
+With the baseline kernels, Q4\_0 shortens the step by 16\% in llama.cpp
+and 8\% in \ds{}. In \ds{}, its gate/up pair takes 171~$\mu$s per layer
+against 196 for Q4\_K. With the fused kernels, the two formats take 30.0
+and 30.8~ms, respectively, a difference of approximately 2.5\%. The fused
+gate/up kernel takes 166~$\mu$s in Q4\_0 and 163 in Q4\_K, both about
+610~GB/s effective. Thus, the simpler format provides no measured advantage
+on the largest projection under these fused implementations.
+
+The remaining differences depend on matrix shape and kernel choice. Q4\_0
+is faster on the narrower projections (84 versus 94~$\mu$s for the
+DeltaNet projections, and 75 versus 82 for attention) but slower on FFN down
+(103 versus 95~$\mu$s), where only Q4\_K uses a K-split kernel. These
+results support evaluating the format and its implementation together; they
+do not isolate dequantization instruction cost from the other kernel
+differences. The smaller latency advantage after fusion is accompanied by
+approximately 4\% higher perplexity for Q4\_0 on the evaluated chunks.
 
 \subsection{A second family: mixture of experts}
 \ds{} was written for DeepSeek V4 Flash, a mixture-of-experts model, and its
@@ -686,14 +719,17 @@ dispatch it would save and did not implement it.
 \section{Discussion}
 \label{sec:discussion}
 \paragraph{What the levers are worth here.} Of the 11.6~ms between
-llama.cpp's step and \ds{}'s, 4.2~ms are the optimizations of this paper and
-the rest is the engine's existing design; the controlled experiments put the
-format lever at 0.8~ms once kernels are fused and at 2.8--6.9~ms when they
-are not. GPU timestamps, CPU critical-path effects and context-dependent
-attention partitioning are not unique to unified memory; what is specific to
-this setting is that at 27B scale on one GPU, per-dispatch cost and CPU gaps
-are each a few percent of the step and add up, and that a slow sampler is
-invisible to every GPU-side tool.
+llama.cpp's forward and \ds{}'s, 4.2~ms are the switches of this paper,
+measured within one engine and one weight file; the rest is a comparison of
+complete engines, which the profiles of \S\ref{sec:anatomy} attribute to
+dispatch count and CPU encoding but which we did not ablate across engines.
+The controlled experiment puts the format lever at 0.8~ms once the kernels
+are fused and at 2.8--6.9~ms when they are not, so the return from changing
+the format depends on the kernels it meets. GPU timestamps, CPU critical-path
+effects and context-dependent attention partitioning are not unique to
+unified memory; what is specific to this setting is that at 27B scale on one
+GPU, per-dispatch cost and CPU gaps are each a few percent of the step and
+add up, and that a slow sampler is invisible to every GPU-side tool.
 \paragraph{Hand-written schedules against frameworks.} \ds{} implements each
 family as a hand-written Metal schedule; the cost is that each new family is a
 port, the benefit is that fusions which depend on the model or the session
@@ -701,13 +737,16 @@ port, the benefit is that fusions which depend on the model or the session
 are local changes with measured effects. llama.cpp and MLX both fuse some
 operators; we have not audited which, and the MLX result shows that a cheaper
 format on a general framework reaches a similar step time.
-\paragraph{What is left.} The remaining 20\% to the estimated bound is split
-between the latency-bound recurrence, the attention path and per-dispatch
-ramp; \S\ref{sec:q40} indicates that dequantization is a small term once the
-large matvecs are fused. The model ships a multi-token prediction block, so
-several candidate positions could be verified per weight pass; the benefit
-depends on acceptance rates, drafting cost and verifying the recurrent state,
-and we have not measured it.
+\paragraph{What is left.} The optimized forward is 6.3~ms above the 24.3~ms
+streaming reference. Because the reference assigns the best observed rate to
+every matrix shape, that difference includes the slower matvecs as well as
+the latency-bound recurrence, the attention path, per-dispatch ramp and host
+work, and the measurements do not partition it exactly; \S\ref{sec:q40}
+indicates that dequantization is a small term once the large matvecs are
+fused. The model ships a multi-token prediction block, so several candidate
+positions could be verified per weight pass; the benefit depends on
+acceptance rates, drafting cost and verifying the recurrent state, and we
+have not measured it.
 
 \section{Related work}
 \paragraph{Local inference runtimes.} llama.cpp and ggml~\cite{llamacpp,ggml}
@@ -756,9 +795,13 @@ A decode step on Apple silicon is not simply bandwidth bound at the 27B
 scale: matvec kernel shape, dispatch count and CPU work between tokens each
 cost milliseconds, and each needs its own measurement. GPU timestamps per
 stage and a CPU inter-token split turned each optimization into a targeted
-change with a measured effect, the switches make the account auditable, and
-the controlled format experiment shows where one lever stops and another
-starts.
+change with a measured effect, and the switches make the account auditable:
+12\% of the step within one engine and weight file, and a sampler fix of
+1.8~ms per token that no GPU-side tool could have found. The controlled
+format experiment shows where one lever stops and another starts: the
+cheaper block format is worth 8--16\% against simple kernels and 2--3\%
+against fused ones, so a quantization format has to be judged together with
+the kernels that read it.
 
 \bibliographystyle{plain}
 \bibliography{refs}
@@ -767,7 +810,7 @@ starts.
 \section{Additional results}
 \label{sec:appendix-results}
 
-\begin{table}[h]
+\begin{table}[ht]
 \centering
 \begin{tabular}{lrr}
 \toprule
@@ -781,7 +824,7 @@ tokens, generation loop per forward, mean of three runs.}
 \label{tab:ablation}
 \end{table}
 
-\begin{table}[h]
+\begin{table}[ht]
 \centering
 \begin{tabular}{rrrrrrr}
 \toprule
@@ -795,8 +838,9 @@ Prompt tokens & \ds{} loop & MLX loop & llama.cpp fwd & \ds{} & MLX & llama.cpp 
 three runs. \ds{} and llama.cpp on pure Q4\_K, MLX on its 4-bit affine
 conversion; all three engines read the same prompt files (hashes in
 \texttt{paper/logs/prompt\_sha256.txt}) and their tokenizers agree on the
-counts shown. On the 32,866-token prompt mlx-lm stopped at 54 tokens (end of
-sequence); its per-forward rate is unaffected.}
+counts shown. On the 32,866-token prompt mlx-lm reported 54 generated tokens
+before stopping at end of sequence; its mean is normalized by 53 decode
+forwards, so it covers a shorter decode window than the other engines.}
 \label{tab:context}
 \end{table}
 
