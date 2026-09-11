@@ -40,7 +40,7 @@ C/Metal engine, we add the model and pull three levers, each behind a runtime
 switch: fewer bytes per token, fewer and better-shaped dispatches, and a
 shorter CPU path between tokens. Our optimizations shorten the step from
 35.0 to 30.8~ms; forward-only, \ds{} takes 30.6~ms against llama.cpp's 42.3,
-with logits matching llama.cpp at nine decode-step and context-length points.
+with logits matching llama.cpp at eight decode-step and context-length points.
 A controlled experiment with the same source checkpoint in Q4\_0 and Q4\_K
 shows the block format is worth 8--16\% with simple kernels and 2--3\% once
 the large matvecs are fused; MLX reaches a comparable step time on its affine
@@ -59,7 +59,7 @@ agents and private workloads. The question on such a machine is no longer
 whether a model fits but how fast it decodes, and the standard answer is a
 roofline argument: a single-stream decode step reads every active weight
 matrix once, so the step time is bounded below by model bytes over memory
-bandwidth. For Qwen3.8-27B in Q4\_K on an M2~Ultra that is 15.05~GB per step
+bandwidth. For Qwen3.8-27B in Q4\_K on an M2~Ultra that is 15.06~GB per step
 at a nominal 800~GB/s, or 18.8~ms; using the streaming rates we measure for
 each format on this GPU, about 24.3~ms (\S\ref{sec:roofline}). llama.cpp takes
 42.3~ms per decode step (\S\ref{sec:eval}). Roughly 18~ms of every step is
